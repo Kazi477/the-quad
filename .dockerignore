@@ -1,0 +1,8 @@
+network.db
+network.db-*
+network_uploads/
+backups/
+__pycache__/
+*.pyc
+.env
+.git/
