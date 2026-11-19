@@ -1001,6 +1001,17 @@ def deliver_reset_email_async(user_id, recipient, code):
 # of an emailed code; it works any time until used, then it is consumed.
 RECOVERY_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
 RECOVERY_CODE_COUNT = 10
+# Update 19: recovery codes are hashed with fewer PBKDF2 iterations
+# than user passwords (100k vs 600k). That is safe here, not a
+# weakening: a code is 12 random characters from a 32-symbol
+# alphabet — about 60 bits of entropy — so even a fast hash cannot
+# be brute-forced offline (2**60 guesses), while a user password
+# needs the full 600k because it may be a weak human-chosen word.
+# check_password() reads the iteration count from the stored hash,
+# so codes created earlier at 600k still verify, and codes created
+# now at 100k verify the same way. The lower cost matters because
+# 10 codes are hashed on every regeneration (see below).
+RECOVERY_CODE_ITERATIONS = 100000
 
 def new_recovery_code():
     raw = ''.join(secrets.choice(RECOVERY_CODE_ALPHABET) for _ in range(12))
@@ -1009,18 +1020,55 @@ def new_recovery_code():
 def normalise_recovery_code(raw):
     return re.sub(r'[\s\-]', '', str(raw or '')).upper()
 
-def generate_recovery_codes(c, user_id):
+def prepare_recovery_codes():
+    """Create 10 fresh codes and their hashes. Pure CPU, no
+    database touch — call this BEFORE opening a write
+    transaction, so the hashing never holds the writer lock
+    (see generate_recovery_codes). Returns (codes, hashed)
+    where hashed is [(code, code_hash), ...]."""
+    codes = [new_recovery_code() for _ in range(RECOVERY_CODE_COUNT)]
+    hashed = [(code, password_hash(normalise_recovery_code(code),
+                                   iterations=RECOVERY_CODE_ITERATIONS))
+              for code in codes]
+    return codes, hashed
+
+def generate_recovery_codes(c, user_id, prepared=None):
     """Replace all of a user's recovery codes with a fresh set of 10.
 
     Returns the plaintext codes (shown once to the signed-in owner).
     Old codes stop working immediately.
+
+    Update 19 (live crash, 2026-11-20): the hashes are computed
+    FIRST, before any database write — either here, before the
+    first write statement, or by the caller passing in a
+    precomputed ``prepared`` pair (so a retry does not re-hash).
+    The old code hashed each code inside the INSERT loop, after
+    the DELETE had already acquired the single-writer lock
+    (Update 16) — so the lock was held for 10 x 600k PBKDF2
+    hashes, ~2.4s of CPU here and ~25-35s on Render free's
+    0.1 CPU, plus a dozen remote Turso writes. While that lock
+    was held, every other request that writes (rate_limit on
+    every page view, session touches) queued behind it:
+    rate_limit retries 3 x 10s, requests passed nginx's 60s
+    timeout and 502d, the whole site looked down for 2-3
+    minutes, and a second regenerate hit the 10s lock timeout
+    and died with the app's 500 page. Hashing first means the
+    lock is only held for the writes themselves. The writes
+    are also wrapped in one explicit BEGIN IMMEDIATE
+    transaction (as rate_limit does) instead of 12 separate
+    remote transactions, so the replica forwards one write
+    transaction to Turso instead of a dozen.
     """
-    codes = [new_recovery_code() for _ in range(RECOVERY_CODE_COUNT)]
+    if prepared is None:
+        codes, hashed = prepare_recovery_codes()
+    else:
+        codes, hashed = prepared
     now = time.time()
+    c.execute('BEGIN IMMEDIATE')
     c.execute('DELETE FROM recovery_codes WHERE user_id=?', (user_id,))
-    for code in codes:
+    for code, code_hash in hashed:
         c.execute('INSERT INTO recovery_codes(user_id,code_hash,used,created) VALUES(?,?,0,?)',
-                  (user_id, password_hash(normalise_recovery_code(code)), now))
+                  (user_id, code_hash, now))
     return codes
 
 def count_unused_recovery_codes(c, user_id):
@@ -2536,10 +2584,47 @@ class Handler(BaseHTTPRequestHandler):
             # authenticated() above. Generates a fresh set of 10 codes
             # and shows them ONCE, in this response — plaintext is never
             # stored, logged or emailed, and old codes stop working.
-            with connect() as c:
-                codes=generate_recovery_codes(c,user['id'])
-                audit_event(c,user['id'],'recovery_codes_regenerated','user',user['id'])
-            return self.settings(user,show_codes=codes)
+            # Update 19: retry a transient lock/WAL failure instead
+            # of dying with the app's 500 page (live, 2026-11-20:
+            # a second regenerate while another writer held the
+            # single-writer lock hit the 10s lock timeout and
+            # 500d). The write transaction rolls back on failure,
+            # so a retry is safe — no codes are stored until the
+            # transaction commits. If it still fails, say so
+            # plainly (503, try again) instead of a bare 500.
+            # Only TWO attempts: rate_limit() above already spent
+            # up to ~30s retrying the same lock (3 x 10s) before
+            # this handler ran, so two more 10s attempts plus the
+            # 0.5s sleep is ~50s worst case — inside nginx's 60s
+            # proxy_read_timeout, so the 503 page actually reaches
+            # the browser instead of being cut off by a 502.
+            codes = None
+            last_exc = None
+            # Hash once, before any write transaction, so a retry
+            # never re-hashes (and never holds the writer lock
+            # while hashing — see generate_recovery_codes).
+            prepared = prepare_recovery_codes()
+            for _attempt in range(2):
+                try:
+                    with connect() as c:
+                        codes = generate_recovery_codes(c, user['id'], prepared)
+                        audit_event(c, user['id'], 'recovery_codes_regenerated', 'user', user['id'])
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if not _rate_limit_is_transient(exc):
+                        raise
+                    print('recovery-codes regenerate: transient DB failure (%s: %s); retrying'
+                          % (type(exc).__name__, exc))
+                    time.sleep(0.5 * (2 ** _attempt))
+            if codes is None:
+                print('recovery-codes regenerate: failed after retries (%s: %s)'
+                      % (type(last_exc).__name__, last_exc))
+                return self.html(shell('Password recovery',
+                    '<section class="card"><h1>Could not create recovery codes</h1>'
+                    '<p>The database was busy just now, so no codes were created and your old codes (if any) still work. Please try again in a moment.</p>'
+                    '<p><a class="btn" href="/settings">Back to Settings</a></p></section>', user), 503)
+            return self.settings(user, show_codes=codes)
         if path=='/block':
             try: target=int(data.get('user_id',''))
             except ValueError: return self.go('/settings')

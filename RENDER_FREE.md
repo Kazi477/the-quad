@@ -343,3 +343,47 @@ health-check timeout), GET / 200, /healthz ok, HEAD / 200,
 - Live cleanup needed before re-testing: sydneytest@example.com
   and sydneytest-20261120@example.com both exist live (stale test
   accounts) and must be removed via the admin panel / DB first.
+
+## Update 19 — Recovery-code regeneration wedged the whole site (2026-11-20)
+- POST /recovery-codes/regenerate crashed live (502, site down
+  2-3 min, then the app's 500 page on retry) while the dev suite
+  said it worked — every suite runs PBKDF2 at 10k iterations,
+  live runs 600k. Root cause: generate_recovery_codes() hashed
+  each code inside the INSERT loop after the DELETE had taken
+  the single-writer lock, so the lock was held for 10 x 600k
+  hashes (~25-35s on Render free's 0.1 CPU) plus a dozen remote
+  Turso writes; every other writing request queued behind it,
+  rate_limit retried 3 x 10s, requests passed nginx's 60s
+  timeout and 502d, and a second regenerate hit the 10s lock
+  timeout and 500d. Proven in dev against a local sqld primary
+  at live iterations (regenerate 3.04s, concurrent GET / 2.69s;
+  at 5x hashing cost, 13.04s / 14.04s).
+- Fix (dev only): hashes are computed before any write
+  (prepare_recovery_codes, 100k iterations for codes — ~60 bits
+  of entropy, old 600k codes still verify); the writes run as
+  one BEGIN IMMEDIATE transaction; the handler retries a
+  transient lock failure twice (rate_limit already spent ~30s,
+  so 2 more attempts keeps the worst case ~50s, inside nginx's
+  60s) and then answers a friendly 503 instead of a 500.
+  Post-fix repro: regenerate 0.49-0.63s, concurrent GET /
+  0.12-0.22s. New regen19_test.py, 23 checks (incl. lock held
+  12s -> regenerate succeeds via retry; lock held 55s ->
+  503 in 52.4s, GET / still 200). Full suite: 668 checks +
+  smoke PASS, 0 failed (all 19 suites exit 0, re-run against
+  a freshly restarted local sqld). Test-hardening after the
+  fix: the Turso part of regen19_test went 18/5 in a
+  full-suite re-run because register-client is limited to
+  5/hour per client fingerprint and all suites share the one
+  local sqld primary — the test now sends a unique
+  X-Forwarded-For per run with TRUST_PROXY=1 on the Turso
+  server, and the "turso regenerate is fast" check now
+  requires status 200 (it had passed vacuously on a 403).
+  Also seen once: the 12s/55s lock-hold checks failed 20/3
+  with sqld answering "Write delegation: Timed out while
+  opening database connection" — a dev-only local-sqld
+  saturation flake; restart the local sqld and re-run, do
+  not "fix" the app for it. See MERGE_NOTES.md Update 19. To
+  deploy after approval: upload to GitHub (e.g. upload12/),
+  redeploy, verify GET / 200, /healthz ok, HEAD / 200,
+  /readyz 200, then re-test live steps 4 and 5 (generate codes,
+  use one to reset, log in with the new password).

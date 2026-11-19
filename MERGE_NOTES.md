@@ -2421,3 +2421,148 @@ unchanged: aae87ec977f13b371de50aedb192cd96.
   then self-delete the account and confirm login then fails.
   Then let the instance sleep and check GET / still returns 200
   after it wakes.
+
+## Update 19 — Recovery-code regeneration crash: hashes held the writer lock (DEV ONLY, 2026-11-20)
+
+Live failure (dummy test, Fri 2026-11-20 ~01:24-01:28 AEST, live
+commit ef50705): Settings -> Password recovery, "Create new
+recovery codes" — the inline two-step confirm armed correctly,
+but the second click (POST /recovery-codes/regenerate) crashed.
+Attempt 1: Render 502, whole site down 2-3 minutes including
+/settings. Attempt 2 after recovery: the app's own 500 page at
+/recovery-codes/regenerate. No codes were created. Steps 1-3 and
+6 of the same test passed (create account, text-only post, log
+out/in, self-delete), so this was specific to regenerate. The
+livefix suite said regenerate worked — because every suite runs
+with PBKDF2_ITERATIONS=10000, so 10 hashes cost ~0.04s there
+instead of ~2.4s at the live default of 600,000.
+
+### Root cause
+generate_recovery_codes() hashed each code INSIDE the INSERT
+loop, after the DELETE had already acquired the single-writer
+lock (Update 16). The lock was held for 10 x 600k PBKDF2 hashes
+plus a dozen separate remote Turso writes: ~2.4s of CPU on this
+VM, ~25-35s on Render free's 0.1 CPU. While the lock was held,
+every other request that writes (rate_limit on every page view,
+session touches) queued behind it: rate_limit retries 3 x 10s,
+requests passed nginx's 60s proxy_read_timeout and 502d, and a
+second regenerate hit the 10s lock timeout and died with the
+app's 500 page. Proven in dev against a local sqld primary in
+Turso mode at the live 600k iterations: regenerate alone 3.04s,
+a concurrent GET / 2.69s, GET /settings 2.70s. At 5x hashing
+cost (PBKDF2_ITERATIONS=3000000, simulating Render's slower
+CPU): regenerate 13.04s, concurrent GETs 14.04s. Post-fix, same
+setup: regenerate 0.49-0.63s, concurrent GET / 0.12-0.22s.
+
+### What changed
+- the_network_production.py (2,994 -> 3,079 lines; .bak-regen19
+  kept; db_backend.py unchanged, .bak-regen19 kept):
+  - New prepare_recovery_codes(): creates the 10 codes and their
+    hashes with NO database touch. New RECOVERY_CODE_ITERATIONS
+    = 100000 for codes (a 12-char code from a 32-symbol alphabet
+    is ~60 bits of entropy, so 100k PBKDF2 is ample; user
+    passwords stay at 600k). check_password() reads the
+    iteration count from the stored hash, so codes created
+    earlier at 600k still verify.
+  - generate_recovery_codes(c, user_id, prepared=None): hashes
+    first (or uses the caller's precomputed pair), then one
+    explicit BEGIN IMMEDIATE transaction with DELETE + 10
+    INSERTs — one remote write transaction to Turso instead of
+    a dozen separate ones.
+  - POST /recovery-codes/regenerate handler: hashes once before
+    any write, then retries a transient lock/WAL failure (2
+    attempts, 0.5s sleep). Only 2 attempts on purpose:
+    rate_limit() already spent up to ~30s retrying the same
+    lock (3 x 10s) before the handler ran, so 2 more 10s
+    attempts is ~50s worst case — inside nginx's 60s timeout,
+    so the failure page actually reaches the browser. If it
+    still fails, a friendly 503 page ("Could not create
+    recovery codes ... your old codes still work. Please try
+    again") instead of the bare 500.
+- New regen19_test.py: 23 checks (plain-sqlite + Turso mode
+  against a local sqld primary; Turso parts skip without sqld).
+  The Turso server runs in-process so the test can hold the
+  wrapper's writer lock itself: lock held 12s -> regenerate
+  succeeds via retry in 12.0s and GET / still answers 200 in
+  11.6s; lock held 55s -> regenerate answers 503 in 52.4s
+  (not 500, not a hang) and GET / still answers 200 in 40.2s;
+  regenerate after release succeeds. Also: full reset flow
+  with a new code (logout -> forgot-password -> reset with
+  the code -> login with the new password), and a code hashed
+  at the old 600k iterations still verifies.
+  Test-hardening fix (same day, after the fix itself): the
+  Turso part of regen19_test went 18/5 on a re-run of the
+  whole suite — not a product regression. All suites share
+  the one local sqld primary, and register-client is limited
+  to 5/hour per client fingerprint, so by the time regen19
+  ran last the bucket was full and its Turso registration
+  429d; every later Turso check then 403d for want of a
+  login. Fixed in the test only: it now sends a unique
+  X-Forwarded-For per run and runs the Turso server with
+  TRUST_PROXY=1, so each run gets a fresh rate-limit bucket
+  (the plain server still runs TRUST_PROXY=0 and ignores
+  the header). Also strengthened the "turso regenerate is
+  fast" check to require status 200 — it had passed
+  vacuously on a 403 in 0.00s. Re-run after the fix:
+  23 passed, 0 failed (Turso regenerate 0.57s, concurrent
+  GETs 0.14s).
+- No branding, features, routes, or auth behaviour changed
+  when healthy. No payment, no credentials.
+
+### Test results — 668 checks + smoke PASS, 0 failed
+smoke PASS; merge 51, auth 25, security 84, fix 32, listening 44,
+top5 78, forgot 45, failover 31, pythonanywhere 12, render_free 30,
+object_storage 68, wal502 20, malformed502 25, fixall 23, flap 26
+(with sqld running; 22 + 2 skipped without it), deployfix 25,
+livefix 26, regen19 23 (new). Full suite re-run against a freshly
+restarted local sqld primary after the test-hardening fix and the
+sqld-saturation flake (see below): all 19 suites exit 0, same
+668 + smoke. Backup zip md5
+re-verified unchanged: aae87ec977f13b371de50aedb192cd96.
+
+### Remaining risks / honest limits
+- Real Turso cloud sync + a real Render spin-down still cannot
+  be tested in dev; the first live redeploy is the true proof.
+  Watch live logs for "Transaction timed-out" / "database write
+  lock timed out" and for the new "recovery-codes regenerate"
+  retry lines.
+- During a long writer wedge, a GET / can still take ~40s
+  (rate_limit retries 3 x 10s before falling back to memory).
+  It answers instead of 502ing, but it is slow; if wedges keep
+  recurring, the next step is per-thread connection reuse or
+  making rate_limit not take the writer lock — not another
+  recovery layer.
+- regen19's lock-hold checks (12s/55s) are sensitive to the
+  shared local sqld primary's health: in one full-suite run
+  they went 20/3 with sqld answering "Write delegation:
+  Timed out while opening database connection" (GET / 500,
+  POST 403 via failed session lookup) while the lock was
+  held — the same checks pass 23/0 standalone and against a
+  freshly restarted sqld. That is a dev-only local-sqld
+  saturation flake, not the app: the fixed regenerate holds
+  the lock ~0.5s, so a 12s/55s hold is an artificial stress.
+  If the full suite shows exactly those 3 failures, restart
+  the local sqld (kill it, start a fresh data dir on
+  127.0.0.1:8080) and re-run; do not "fix" the app for it.
+  The live Turso cloud primary is not a single local sqld
+  shared by 19 test suites.
+- consume_recovery_code() (reset path) can still do up to 10
+  check_password hashes (600k for old codes, 100k for new
+  ones) — but it does them BEFORE any write on that
+  connection, so it never holds the writer lock while hashing.
+- The 2-3 minute live outage is explained by the mechanism
+  above (lock hold ~30-50s per attempt, plus rate_limit
+  retries on every other request, plus the second attempt's
+  500), but the exact live timings were not captured in logs.
+
+### To deploy after Mitchell approves
+- Upload to GitHub (new staging dir, e.g. `upload12/`), then
+  redeploy the-quad-free on Render (auto-deploy on commit
+  should trigger; verify manually if it does not). No env var
+  or secret changes. After deploy, verify: GET / 200, /healthz
+  ok, HEAD / 200, /readyz 200. Then re-test live steps 4 and
+  5: in Settings -> Password recovery, generate codes and
+  confirm the 10 codes are shown; log out, use one code on
+  Forgot password to reset, log in with the new password.
+  Then let the instance sleep and check GET / still returns
+  200 after it wakes.
