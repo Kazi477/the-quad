@@ -87,7 +87,44 @@ def init_db():
         CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);
         ''')
         for col, decl in [('display_name','TEXT'),('bio','TEXT'),('interests','TEXT'),('avatar_key','TEXT'),('recovery_hash','TEXT'),('must_change_password','INTEGER NOT NULL DEFAULT 0')]: add_column(c,'users',col,decl)
-        for col, decl in [('media_key','TEXT'),('media_type','TEXT'),('music_track','TEXT'),('spotify_url','TEXT'),('spotify_track_id','TEXT')]: add_column(c,'posts',col,decl)
+        for col, decl in [('media_key','TEXT'),('media_type','TEXT'),('music_track','TEXT'),('spotify_url','TEXT'),('spotify_track_id','TEXT'),('original_post_id','INTEGER'),('group_id','INTEGER'),('is_pinned','INTEGER NOT NULL DEFAULT 0'),('is_hidden','INTEGER NOT NULL DEFAULT 0')]: add_column(c,'posts',col,decl)
+        add_column(c,'comments','parent_id','INTEGER')
+        # Top 5 (Update 6): hashtags, reactions, saved/pinned, groups, events,
+        # polls, reports, notification prefs. FTS5 for post search, kept in
+        # sync by triggers; if FTS5 is unavailable the search code falls
+        # back to LIKE (see search_posts).
+        c.executescript('''
+        CREATE TABLE IF NOT EXISTS hashtags(id INTEGER PRIMARY KEY AUTOINCREMENT,tag TEXT NOT NULL UNIQUE,created REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS post_hashtags(post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,hashtag_id INTEGER NOT NULL REFERENCES hashtags(id) ON DELETE CASCADE,PRIMARY KEY(post_id,hashtag_id));
+        CREATE TABLE IF NOT EXISTS reactions(post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,kind TEXT NOT NULL,created REAL NOT NULL,PRIMARY KEY(post_id,user_id));
+        CREATE TABLE IF NOT EXISTS comment_reactions(comment_id INTEGER NOT NULL REFERENCES comments(id) ON DELETE CASCADE,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,kind TEXT NOT NULL,created REAL NOT NULL,PRIMARY KEY(comment_id,user_id));
+        CREATE TABLE IF NOT EXISTS saved_posts(user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,created REAL NOT NULL,PRIMARY KEY(user_id,post_id));
+        CREATE TABLE IF NOT EXISTS groups(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',visibility TEXT NOT NULL DEFAULT 'public',owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,created REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS group_members(group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,role TEXT NOT NULL DEFAULT 'member',status TEXT NOT NULL DEFAULT 'accepted',created REAL NOT NULL,PRIMARY KEY(group_id,user_id));
+        CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT,group_id INTEGER REFERENCES groups(id) ON DELETE CASCADE,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,title TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',location TEXT NOT NULL DEFAULT '',starts_at REAL NOT NULL,created REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS event_rsvps(event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,status TEXT NOT NULL,created REAL NOT NULL,PRIMARY KEY(event_id,user_id));
+        CREATE TABLE IF NOT EXISTS polls(id INTEGER PRIMARY KEY AUTOINCREMENT,post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,question TEXT NOT NULL,created REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS poll_options(id INTEGER PRIMARY KEY AUTOINCREMENT,poll_id INTEGER NOT NULL REFERENCES polls(id) ON DELETE CASCADE,text TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS poll_votes(poll_id INTEGER NOT NULL REFERENCES polls(id) ON DELETE CASCADE,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,option_id INTEGER NOT NULL REFERENCES poll_options(id) ON DELETE CASCADE,created REAL NOT NULL,PRIMARY KEY(poll_id,user_id));
+        CREATE TABLE IF NOT EXISTS reports(id INTEGER PRIMARY KEY AUTOINCREMENT,reporter_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,target_type TEXT NOT NULL,target_id TEXT NOT NULL,reason TEXT NOT NULL,details TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'open',created REAL NOT NULL,updated REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS notification_prefs(user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,kind TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(user_id,kind));
+        CREATE INDEX IF NOT EXISTS reports_status_idx ON reports(status,created);
+        CREATE INDEX IF NOT EXISTS groups_created_idx ON groups(created);
+        CREATE INDEX IF NOT EXISTS events_starts_idx ON events(starts_at);
+        CREATE INDEX IF NOT EXISTS posts_group_idx ON posts(group_id,created);
+        CREATE INDEX IF NOT EXISTS posts_hidden_idx ON posts(is_hidden,created);
+        ''')
+        try:
+            c.execute("CREATE VIRTUAL TABLE IF NOT EXISTS posts_fts USING fts5(body, content='posts', content_rowid='id')")
+            c.executescript('''
+            CREATE TRIGGER IF NOT EXISTS posts_fts_ai AFTER INSERT ON posts BEGIN INSERT INTO posts_fts(rowid, body) VALUES (new.id, new.body); END;
+            CREATE TRIGGER IF NOT EXISTS posts_fts_ad AFTER DELETE ON posts BEGIN INSERT INTO posts_fts(posts_fts, rowid, body) VALUES('delete', old.id, old.body); END;
+            CREATE TRIGGER IF NOT EXISTS posts_fts_au AFTER UPDATE ON posts BEGIN INSERT INTO posts_fts(posts_fts, rowid, body) VALUES('delete', old.id, old.body); INSERT INTO posts_fts(rowid, body) VALUES (new.id, new.body); END;
+            ''')
+            # Backfill any posts that predate the FTS table.
+            c.execute("INSERT INTO posts_fts(rowid, body) SELECT id, body FROM posts WHERE id NOT IN (SELECT rowid FROM posts_fts)")
+        except sqlite3.Error as exc:
+            print('FTS5 post search unavailable, search will use LIKE:', exc)
         c.executescript('''
         CREATE TABLE IF NOT EXISTS uploads(key TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,content_type TEXT NOT NULL,size INTEGER NOT NULL,created REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS likes(post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,created REAL NOT NULL,PRIMARY KEY(post_id,user_id));
@@ -470,6 +507,7 @@ CSS = '''
 .spotify-note{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:14px;padding:12px;margin:10px 0}
 .spotify-embed{width:100%;height:80px;border:0;border-radius:12px;margin-top:8px}
 .now-listening{margin-top:6px}
+.reaction-bar{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.reaction-bar button{flex:1;background:transparent;color:#596a81;border:1px solid var(--line);border-radius:999px;padding:6px 8px;font-size:13px}.reaction-bar button.on{background:#e6f4f2;color:var(--brand-dark);border-color:#99f6e4}.thread-reply{margin-left:28px;border-left:3px solid var(--line);padding-left:10px}.tag-chip{display:inline-block;background:#e6f4f2;color:var(--brand-dark);border-radius:999px;padding:4px 10px;margin:2px 4px 2px 0;font-weight:700;font-size:13px}.repost-quote{border-left:3px solid var(--brand);background:var(--soft);border-radius:12px;padding:10px 12px;margin:10px 0}.poll-box{border:1px solid var(--line);border-radius:14px;padding:12px;margin:10px 0}.poll-bar{height:8px;background:#e5e7eb;border-radius:999px;overflow:hidden;margin:4px 0 10px}.poll-bar i{display:block;height:100%;background:var(--brand)}
 .auth-wrap{display:grid;grid-template-columns:1.05fr .95fr;gap:22px;align-items:stretch;margin-top:8px}.auth-hero{background:linear-gradient(135deg,#0f766e,#14b8a6);color:#fff;border:0;padding:30px;display:flex;flex-direction:column;justify-content:center}.auth-hero h1{color:#fff;font-size:34px;margin:10px 0 12px}.auth-hero p{color:#d7f5f1}.auth-hero ul{list-style:none;margin:18px 0 0;padding:0;display:grid;gap:10px}.auth-hero li{font-weight:650;color:#fff}.auth-hero li span{color:#a7f3d0;margin-right:8px}.auth-card{padding:28px}.auth-card h2{font-size:24px}.auth-switch{text-align:center;margin:16px 0 0}.auth-switch a{font-weight:700}.password-wrap{position:relative}.password-wrap input{padding-right:64px}.password-toggle{position:absolute;right:6px;top:7px;background:transparent;color:var(--brand-dark);padding:6px 10px;font-size:12px;border-radius:999px}.password-toggle:hover{background:var(--soft);transform:none}.pw-meter{height:8px;background:#e5e7eb;border-radius:999px;overflow:hidden;margin-top:8px}.pw-meter i{display:block;height:100%;width:0;background:var(--brand);transition:width .2s}.pw-hint{font-size:12px;color:var(--muted);margin-top:6px}.auth-note{margin-top:14px}.brand-dot{color:var(--brand)}.rail-h2{margin-top:18px}.shield-h2{margin-top:14px}.confirm-email{width:220px;max-width:100%}.av30{width:30px;height:30px;font-size:13px}.av32{width:32px;height:32px;font-size:14px}.av34{width:34px;height:34px;font-size:14px}.av42{width:42px;height:42px;font-size:18px}.av54{width:54px;height:54px;font-size:20px}.av64{width:64px;height:64px;font-size:22px}.av80{width:80px;height:80px;font-size:26px}.av90{width:90px;height:90px;font-size:28px}.tb3{height:3%}.tb5{height:5%}.tb10{height:10%}.tb15{height:15%}.tb20{height:20%}.tb25{height:25%}.tb30{height:30%}.tb35{height:35%}.tb40{height:40%}.tb45{height:45%}.tb50{height:50%}.tb55{height:55%}.tb60{height:60%}.tb65{height:65%}.tb70{height:70%}.tb75{height:75%}.tb80{height:80%}.tb85{height:85%}.tb90{height:90%}.tb95{height:95%}.tb100{height:100%}
 @media(max-width:400px){header{padding:8px 10px}.brand{font-size:19px}nav a{font-size:11px;padding:5px 7px}main{padding:0 8px}.card{padding:12px;border-radius:14px}h1{font-size:22px}.auth-hero{padding:16px}.auth-hero h1{font-size:22px}.auth-card{padding:16px}.metric-grid{grid-template-columns:1fr}.metric b{font-size:19px}.traffic-chart{height:120px}.traffic-bar small{display:none}.story{width:64px}.story .avatar{width:48px!important;height:48px!important}.message-list{height:300px}.comment-form{flex-wrap:wrap}.table-row{flex-direction:column;align-items:flex-start;gap:6px}.confirm-email{width:100%}.music-bar{padding:6px 10px}.music-bar button{padding:6px 10px;font-size:12px}}
 @media(max-width:1000px){.layout{grid-template-columns:135px minmax(0,1fr)}.rail{position:static;grid-column:2}}@media(max-width:650px){header{position:relative;padding:10px 12px}.brand{font-size:21px}nav{gap:1px}nav a{font-size:12px;padding:6px 9px}main{margin:14px auto;padding:0 10px}.layout{display:block}.side{position:static;display:flex;overflow:auto;gap:4px;margin-bottom:10px}.side a{white-space:nowrap;font-size:13px;padding:8px 12px}.card{padding:14px;border-radius:16px}.grid{grid-template-columns:1fr}h1{font-size:25px}.person{flex-wrap:wrap}.person form{margin-left:4px}.comment-form{align-items:stretch}.comment-form button{padding:8px}.metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.metric b{font-size:21px}.traffic-chart{gap:2px;height:150px}.traffic-bar small{font-size:8px}.auth-wrap{grid-template-columns:1fr}.auth-hero{padding:20px}.auth-hero h1{font-size:26px}.auth-card{padding:20px}.table-row{flex-wrap:wrap}.table-row span{overflow-wrap:anywhere}.music-bar{flex-wrap:wrap;border-radius:16px}.story{width:76px}.story .avatar{width:56px!important;height:56px!important}}}
@@ -482,7 +520,7 @@ def shell(title, content, user=None, error=''):
         with connect() as c:
             counts=c.execute("SELECT (SELECT COUNT(*) FROM friendships WHERE addressee_id=? AND status='pending') friends,(SELECT COUNT(*) FROM notifications WHERE user_id=? AND read_at IS NULL) alerts,(SELECT COUNT(*) FROM messages WHERE recipient_id=? AND read_at IS NULL) messages",(user['id'],user['id'],user['id'])).fetchone()
             friend_count,alert_count,message_count=counts['friends'],counts['alerts'],counts['messages']
-        items=[('/', 'Feed', 0),('/people','People',0),('/friends','Friends',friend_count),('/messages','Messages',message_count),('/notifications','Alerts',alert_count),('/profile','Profile',0),('/settings','Settings',0)]
+        items=[('/', 'Feed', 0),('/explore','Explore',0),('/groups','Groups',0),('/people','People',0),('/friends','Friends',friend_count),('/messages','Messages',message_count),('/notifications','Alerts',alert_count),('/profile','Profile',0),('/settings','Settings',0)]
         links = ''.join('<a href="%s">%s%s</a>' % (path,text,('<span class="badge">%s</span>'%count) if count else '') for path,text,count in items)
         nav = links + ('<a href="/admin">Admin</a>' if user['is_admin'] else '') + '<form class="inline" method="post" action="/logout"><input type="hidden" name="csrf" value="%s"><button class="light">Sign out</button></form>' % esc(user['csrf'])
         footer = 'Posts and profile information are visible to signed-in members. Keep sensitive details private.'
@@ -550,8 +588,94 @@ def change_password_page(user, error='', forced=False):
 
 
 def form_csrf(user): return '<input type="hidden" name="csrf" value="%s">' % esc(user['csrf'])
+# Notification kinds (Update 6). Preferences default to on; a stored
+# enabled=0 suppresses that kind for that user. Push is NOT supported:
+# it would need a service worker + VAPID + a push sender, which this
+# single-file server does not have.
+NOTIF_KINDS = ('like','comment','friend_request','friend_accept','message','repost','reaction','group_invite','event_invite','event_reminder','report_update')
+REACTION_KINDS = ('nod','love','laugh','support')
+REACTION_LABELS = {'nod':'Nod','love':'Love','laugh':'Laugh','support':'Support'}
+REACTION_EMOJI = {'nod':'♥','love':'❤️','laugh':'😂','support':'🙌'}
+HASHTAG_RE = re.compile(r'#([A-Za-z0-9_]{1,50})')
+def extract_hashtags(body):
+    return sorted({t.lower() for t in HASHTAG_RE.findall(body or '')})
+def store_hashtags(c, post_id, body):
+    for tag in extract_hashtags(body):
+        c.execute('INSERT OR IGNORE INTO hashtags(tag,created) VALUES(?,?)',(tag,time.time()))
+        hid=c.execute('SELECT id FROM hashtags WHERE tag=?',(tag,)).fetchone()['id']
+        c.execute('INSERT OR IGNORE INTO post_hashtags(post_id,hashtag_id) VALUES(?,?)',(post_id,hid))
+def render_body(body):
+    """Escape post text, then link #hashtags to their tag pages."""
+    out=esc(body or '')
+    return HASHTAG_RE.sub(lambda m:'<a href="/tag/%s">#%s</a>'%(esc(m.group(1).lower()),esc(m.group(1))), out)
 def notification(c, target, actor, kind, text, target_id=None):
+    pref=c.execute('SELECT enabled FROM notification_prefs WHERE user_id=? AND kind=?',(target,kind)).fetchone()
+    if pref is not None and not pref['enabled']:
+        return
     c.execute('INSERT INTO notifications(id,user_id,actor_id,kind,target_id,body,created) VALUES(?,?,?,?,?,?,?)',(uuid.uuid4().hex,target,actor,kind,target_id,text,time.time()))
+def can_view_repost(c, viewer_id, repost):
+    """A repost inherits the original post's audience: if the viewer
+    cannot see the original (private/blocked), the repost is hidden
+    even if they are friends with the reposter."""
+    if not repost['original_post_id']:
+        return can_view_post(c, viewer_id, repost['user_id'])
+    orig=c.execute('SELECT user_id FROM posts WHERE id=?',(repost['original_post_id'],)).fetchone()
+    if not orig:
+        return can_view_post(c, viewer_id, repost['user_id'])
+    return can_view_post(c, viewer_id, orig['user_id']) and can_view_post(c, viewer_id, repost['user_id'])
+def group_role(c, group_id, user_id):
+    row=c.execute('SELECT role,status FROM group_members WHERE group_id=? AND user_id=?',(group_id,user_id)).fetchone()
+    return row
+def can_view_group(c, group_id, user_id):
+    g=c.execute('SELECT * FROM groups WHERE id=?',(group_id,)).fetchone()
+    if not g:
+        return None
+    if g['visibility']=='public':
+        return g
+    m=group_role(c, group_id, user_id)
+    return g if (m and m['status']=='accepted') or g['owner_id']==user_id else None
+def search_posts(c, viewer_id, query, limit=50):
+    """Post search, privacy-filtered in Python. FTS5 first, LIKE fallback.
+    Returns visible posts (newest first). Private/blocked posts never leak."""
+    q=(query or '').strip()[:120]
+    if not q:
+        return []
+    rows=[]
+    try:
+        phrase='"'+q.replace('"','')+'"'
+        rows=c.execute('SELECT p.* FROM posts_fts f JOIN posts p ON p.id=f.rowid WHERE posts_fts MATCH ? ORDER BY p.created DESC LIMIT ?',(phrase,limit*3)).fetchall()
+    except Exception:
+        rows=[]
+    if not rows:
+        term='%'+escape_like(q)+'%'
+        rows=c.execute('SELECT * FROM posts WHERE body LIKE ? ORDER BY created DESC LIMIT ?',(term,limit*3)).fetchall()
+    out=[]
+    for p in rows:
+        if p['is_hidden']:
+            continue
+        if p['group_id']:
+            if not can_view_group(c, p['group_id'], viewer_id):
+                continue
+        elif not can_view_repost(c, viewer_id, p):
+            continue
+        out.append(p)
+        if len(out)>=limit:
+            break
+    return out
+def trending_posts(c, viewer_id, limit=20):
+    """Simple time-decayed score: (nods*3 + comments*2) / (1 + age_hours/24).
+    Computed over recent visible posts; no ranking service involved."""
+    now=time.time()
+    rows=c.execute('''SELECT p.*,(SELECT COUNT(*) FROM likes l WHERE l.post_id=p.id) likes,(SELECT COUNT(*) FROM comments cm WHERE cm.post_id=p.id) comments FROM posts p WHERE p.created>? AND p.is_hidden=0 AND p.group_id IS NULL ORDER BY p.created DESC LIMIT 200''',(now-14*86400,)).fetchall()
+    scored=[]
+    for p in rows:
+        if not can_view_repost(c, viewer_id, p):
+            continue
+        age_h=max(0,(now-p['created'])/3600)
+        score=(p['likes']*3+p['comments']*2)/(1+age_h/24.0)
+        scored.append((score,p))
+    scored.sort(key=lambda x:-x[0])
+    return scored[:limit]
 def relationship(c, a, b):
     return c.execute('SELECT * FROM friendships WHERE (requester_id=? AND addressee_id=?) OR (requester_id=? AND addressee_id=?)',(a,b,b,a)).fetchone()
 def are_friends(c,a,b):
@@ -784,7 +908,20 @@ class Handler(BaseHTTPRequestHandler):
             query=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             try:page=max(0,min(1000,int(query.get('page',['0'])[0])))
             except ValueError:page=0
-            return self.feed(user,query.get('sort',['newest'])[0],page)
+            return self.feed(user,query.get('sort',['newest'])[0],page,query.get('feed',['all'])[0])
+        if path=='/explore':return self.explore(user)
+        if path=='/search':return self.search_page(user,urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('q',[''])[0])
+        if path=='/groups':return self.groups_page(user)
+        if path.startswith('/group/'):
+            try:gid=int(path.split('/')[-1])
+            except ValueError:return self.html(shell('Group','<section class="card">Group not found.</section>',user),404)
+            return self.group_page(user,gid)
+        if path=='/events':return self.events_page(user)
+        if path=='/saved':return self.saved_page(user)
+        if path.startswith('/tag/'):
+            return self.tag_page(user,urllib.parse.unquote(path[len('/tag/'):]))
+        if path=='/admin/moderation':return self.moderation_page(user)
+        if path=='/export-data':return self.export_data(user)
         if path=='/profile':return self.profile(user)
         if path=='/notes/refresh':return self.listening_refresh(user)
         if path=='/people':return self.people(user,urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('q',[''])[0])
@@ -816,15 +953,36 @@ class Handler(BaseHTTPRequestHandler):
             '<input type="hidden" name="email" value="%s"><button class="light">Send another code</button></form></section>'
             ) % (esc(message), reset_token('reset-password'), esc(email), reset_token('send-reset'), esc(email))
         return self.html(shell('Reset password',content))
-    def feed(self,user,sort='newest',page=0):
+    def feed(self,user,sort='newest',page=0,feed_mode='all'):
         sort=sort if sort in ('newest','oldest','liked') else 'newest'
+        feed_mode=feed_mode if feed_mode in ('all','following') else 'all'
         page=max(0,min(1000,int(page)));page_size=20
         order={'newest':'p.created DESC,p.id DESC','oldest':'p.created ASC,p.id ASC','liked':'likes DESC,p.created DESC,p.id DESC'}[sort]
         with connect() as c:
-            posts=c.execute('''SELECT p.*,u.name,u.display_name,u.avatar_key,(SELECT COUNT(*) FROM likes l WHERE l.post_id=p.id) likes,(SELECT COUNT(*) FROM likes l WHERE l.post_id=p.id AND l.user_id=?) liked,(SELECT COUNT(*) FROM comments cm WHERE cm.post_id=p.id) comments FROM posts p JOIN users u ON u.id=p.user_id WHERE (p.user_id=? OR COALESCE((SELECT private_account FROM user_settings s WHERE s.user_id=p.user_id),0)=0 OR EXISTS (SELECT 1 FROM friendships f WHERE f.status='accepted' AND ((f.requester_id=p.user_id AND f.addressee_id=?) OR (f.addressee_id=p.user_id AND f.requester_id=?)))) AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.blocker_id=? AND b.blocked_id=p.user_id) OR (b.blocker_id=p.user_id AND b.blocked_id=?)) ORDER BY '''+order+''' LIMIT 21 OFFSET ?''',(user['id'],user['id'],user['id'],user['id'],user['id'],user['id'],page*page_size)).fetchall()
-            has_more=len(posts)>page_size;posts=posts[:page_size]
+            posts=c.execute('''SELECT p.*,u.name,u.display_name,u.avatar_key,(SELECT COUNT(*) FROM likes l WHERE l.post_id=p.id) likes,(SELECT COUNT(*) FROM likes l WHERE l.post_id=p.id AND l.user_id=?) liked,(SELECT COUNT(*) FROM comments cm WHERE cm.post_id=p.id) comments FROM posts p JOIN users u ON u.id=p.user_id WHERE p.is_hidden=0 AND p.group_id IS NULL AND (p.user_id=? OR COALESCE((SELECT private_account FROM user_settings s WHERE s.user_id=p.user_id),0)=0 OR EXISTS (SELECT 1 FROM friendships f WHERE f.status='accepted' AND ((f.requester_id=p.user_id AND f.addressee_id=?) OR (f.addressee_id=p.user_id AND f.requester_id=?)))) AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.blocker_id=? AND b.blocked_id=p.user_id) OR (b.blocker_id=p.user_id AND b.blocked_id=?)) ORDER BY '''+order+''' LIMIT 21 OFFSET ?''',(user['id'],user['id'],user['id'],user['id'],user['id'],user['id'],page*page_size)).fetchall()
+            # Privacy inheritance for reposts + following-only filter, in Python.
+            visible=[]
+            for p in posts:
+                if not can_view_repost(c,user['id'],p):
+                    continue
+                if feed_mode=='following' and p['user_id']!=user['id'] and not are_friends(c,user['id'],p['user_id']):
+                    continue
+                visible.append(p)
+            raw_full=len(posts)>page_size
+            posts=visible[:page_size];has_more=raw_full or len(visible)>page_size
+            # Reaction counts by type, and the viewer's own reaction, per post.
+            react_counts={};my_react={}
+            if posts:
+                ids=','.join(str(p['id']) for p in posts)
+                for r in c.execute('SELECT post_id,kind,COUNT(*) n FROM reactions WHERE post_id IN (%s) GROUP BY post_id,kind'%ids).fetchall():
+                    react_counts.setdefault(r['post_id'],{})[r['kind']]=r['n']
+                for r in c.execute('SELECT post_id,kind FROM reactions WHERE post_id IN (%s) AND user_id=?'%(ids),(user['id'],)).fetchall():
+                    my_react[r['post_id']]=r['kind']
+                saved_ids={r['post_id'] for r in c.execute('SELECT post_id FROM saved_posts WHERE user_id=? AND post_id IN (%s)'%(ids),(user['id'],)).fetchall()}
+            else:
+                saved_ids=set()
             friends=c.execute("SELECT u.* FROM friendships f JOIN users u ON u.id=CASE WHEN f.requester_id=? THEN f.addressee_id ELSE f.requester_id END WHERE (f.requester_id=? OR f.addressee_id=?) AND f.status='accepted' ORDER BY COALESCE(u.display_name,u.name) LIMIT 6",(user['id'],user['id'],user['id'])).fetchall()
-            friend_posts=c.execute("SELECT p.id,p.user_id,p.body,p.created,p.media_key,p.media_type,u.name,u.display_name,u.avatar_key FROM posts p JOIN users u ON u.id=p.user_id WHERE p.user_id IN (SELECT CASE WHEN f.requester_id=? THEN f.addressee_id ELSE f.requester_id END FROM friendships f WHERE (f.requester_id=? OR f.addressee_id=?) AND f.status='accepted') AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.blocker_id=? AND b.blocked_id=p.user_id) OR (b.blocker_id=p.user_id AND b.blocked_id=?)) ORDER BY p.created DESC,p.id DESC LIMIT 4",(user['id'],user['id'],user['id'],user['id'],user['id'])).fetchall()
+            friend_posts=c.execute("SELECT p.id,p.user_id,p.body,p.created,p.media_key,p.media_type,u.name,u.display_name,u.avatar_key FROM posts p JOIN users u ON u.id=p.user_id WHERE p.is_hidden=0 AND p.user_id IN (SELECT CASE WHEN f.requester_id=? THEN f.addressee_id ELSE f.requester_id END FROM friendships f WHERE (f.requester_id=? OR f.addressee_id=?) AND f.status='accepted') AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.blocker_id=? AND b.blocked_id=p.user_id) OR (b.blocker_id=p.user_id AND b.blocked_id=?)) ORDER BY p.created DESC,p.id DESC LIMIT 4",(user['id'],user['id'],user['id'],user['id'],user['id'])).fetchall()
             incoming=c.execute("SELECT f.requester_id AS user_id,u.* FROM friendships f JOIN users u ON u.id=f.requester_id WHERE f.addressee_id=? AND f.status='pending' ORDER BY f.created DESC",(user['id'],)).fetchall()
             stories=c.execute("SELECT u.*,MAX(p.created) mc FROM users u JOIN posts p ON p.user_id=u.id WHERE u.id=? OR u.id IN (SELECT CASE WHEN f.requester_id=? THEN f.addressee_id ELSE f.requester_id END FROM friendships f WHERE (f.requester_id=? OR f.addressee_id=?) AND f.status='accepted') GROUP BY u.id ORDER BY mc DESC LIMIT 8",(user['id'],user['id'],user['id'],user['id'])).fetchall()
             note_rows=c.execute("SELECT * FROM listening_notes WHERE expires_at>? AND (user_id=? OR user_id IN (SELECT CASE WHEN f.requester_id=? THEN f.addressee_id ELSE f.requester_id END FROM friendships f WHERE (f.requester_id=? OR f.addressee_id=?) AND f.status='accepted'))",(time.time(),user['id'],user['id'],user['id'],user['id'])).fetchall()
@@ -846,24 +1004,40 @@ class Handler(BaseHTTPRequestHandler):
                 content+='<div class="person">%s<b class="grow">%s</b><form method="post" action="/friend">%s<input type="hidden" name="user_id" value="%s"><input type="hidden" name="action" value="accept"><button>Accept</button></form><form method="post" action="/friend">%s<input type="hidden" name="user_id" value="%s"><input type="hidden" name="action" value="decline"><button class="light">Decline</button></form></div>'%(avatar(m),esc(display(m)),form_csrf(user),m['user_id'],form_csrf(user),m['user_id'])
             content+='</section>'
         content+=listening_note_form(user, own_note)
-        content+='<section class="card"><h2>Share a post</h2><form method="post" action="/posts" enctype="multipart/form-data" data-video-form="1">%s<textarea name="body" maxlength="2000" placeholder="What’s on your mind?"></textarea><label>Add a photo or video (videos up to 30 seconds)</label><input type="file" name="media" accept="image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm"><label>Attach Quad Radio music (optional) — built-in synth loops, not real songs</label><select name="music_track"><option value="">No music</option><option value="quad-dawn">Quad Radio · Dawn Loop</option><option value="quad-night">Quad Radio · Night Loop</option><option value="quad-quad">Quad Radio · Quad Anthem</option></select><label>Attach a Spotify track (optional) — paste a Spotify track link to show a link and preview player on your post</label><input name="spotify_link" maxlength="300" placeholder="https://open.spotify.com/track/..."><div class="music-bar"><span class="small grow">Preview Quad Radio:</span><button type="button" data-quad-track="quad-dawn">▶ Dawn</button><button type="button" data-quad-track="quad-night">▶ Night</button><button type="button" data-quad-track="quad-quad">▶ Anthem</button></div><input type="hidden" name="duration_ms" value=""><button class="btn">Share post</button></form></section><div class="row"><h2 class="grow">Your feed</h2><form method="get"><select name="sort"><option value="newest" %s>Newest</option><option value="oldest" %s>Oldest</option><option value="liked" %s>Most nodded</option></select><button class="light">Sort</button></form></div>'%(form_csrf(user),'selected' if sort=='newest' else '','selected' if sort=='oldest' else '','selected' if sort=='liked' else '')
+        content+='<section class="card"><h2>Share a post</h2><form method="post" action="/posts" enctype="multipart/form-data" data-video-form="1">%s<textarea name="body" maxlength="2000" placeholder="What’s on your mind? #hashtags welcome"></textarea><label>Add a photo or video (videos up to 30 seconds)</label><input type="file" name="media" accept="image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm"><label>Attach Quad Radio music (optional) — built-in synth loops, not real songs</label><select name="music_track"><option value="">No music</option><option value="quad-dawn">Quad Radio · Dawn Loop</option><option value="quad-night">Quad Radio · Night Loop</option><option value="quad-quad">Quad Radio · Quad Anthem</option></select><label>Attach a Spotify track (optional) — paste a Spotify track link to show a link and preview player on your post</label><input name="spotify_link" maxlength="300" placeholder="https://open.spotify.com/track/..."><div class="music-bar"><span class="small grow">Preview Quad Radio:</span><button type="button" data-quad-track="quad-dawn">▶ Dawn</button><button type="button" data-quad-track="quad-night">▶ Night</button><button type="button" data-quad-track="quad-quad">▶ Anthem</button></div><input type="hidden" name="duration_ms" value=""><button class="btn">Share post</button></form></section><div class="row"><h2 class="grow">Your feed</h2><form method="get"><select name="feed"><option value="all" %s>Everyone</option><option value="following" %s>Friends only</option></select><select name="sort"><option value="newest" %s>Newest</option><option value="oldest" %s>Oldest</option><option value="liked" %s>Most nodded</option></select><button class="light">Sort</button></form></div><p class="small"><a href="/explore">Explore trending &amp; hashtags</a> · <a href="/saved">Saved posts</a></p>'%(form_csrf(user),'selected' if feed_mode=='all' else '','selected' if feed_mode=='following' else '','selected' if sort=='newest' else '','selected' if sort=='oldest' else '','selected' if sort=='liked' else '')
         if not posts and page==0: content+='<section class="card">No posts yet. Find people or write the first post.</section>'
         for p in posts:
             content+='<article class="card"><div class="row">%s<div class="grow"><a href="/member/%s"><b>%s</b></a><time>%s</time></div>'%(avatar(p),p['user_id'],esc(display(p)),esc(date(p['created'])))
             if p['user_id']==user['id'] or user['is_admin']:content+='<form method="post" action="/delete" data-confirm="Remove this post?">%s<input type="hidden" name="post_id" value="%s"><button class="danger">Remove</button></form>'%(form_csrf(user),p['id'])
             content+='</div>'
-            if p['body']:content+='<div class="post">%s</div>'%esc(p['body'])
+            if p['original_post_id']:
+                with connect() as _c:
+                    _orig=_c.execute('SELECT p.body,u.name,u.display_name FROM posts p JOIN users u ON u.id=p.user_id WHERE p.id=?',(p['original_post_id'],)).fetchone()
+                if _orig:
+                    content+='<div class="repost-quote"><b>Reposted from %s</b><div class="post">%s</div></div>'%(esc(display(_orig)),render_body(_orig['body']))
+                else:
+                    content+='<div class="repost-quote"><b>Reposted post</b><p class="small">The original post is no longer available.</p></div>'
+            if p['body']:content+='<div class="post">%s</div>'%render_body(p['body'])
             if p['media_key']:
                 tag='video' if (p['media_type'] or '').startswith('video/') else 'img'
                 if tag=='video':content+='<video class="media" controls playsinline preload="none" src="/media/%s"></video>'%urllib.parse.quote(p['media_key'])
                 else:content+='<img class="media" loading="lazy" decoding="async" src="/media/%s" alt="Post photo">'%urllib.parse.quote(p['media_key'])
             if p['music_track'] and p['music_track'] in MUSIC_TRACKS:content+='<div class="music-bar"><button type="button" data-quad-track="%s">▶ Play</button><span class="small grow">%s · built-in loop</span></div>'%(esc(p['music_track']),esc(MUSIC_TRACKS[p['music_track']]))
             if p['spotify_track_id']:content+='<div class="spotify-note"><a href="https://open.spotify.com/track/%s" target="_blank" rel="noopener">♫ Listen on Spotify</a>%s</div>'%(esc(p['spotify_track_id']),spotify_embed_html(p['spotify_track_id']))
-            content+='<p class="muted">%s %s · <a href="/post/%s">%s comments</a></p><div class="actions"><form method="post" action="/like">%s<input type="hidden" name="post_id" value="%s"><input type="hidden" name="action" value="%s"><button class="%s">%s %s</button></form><a class="btn light" href="/post/%s">Comment</a></div></article>'%(p['likes'],'nod(s)',p['id'],p['comments'],form_csrf(user),p['id'],'unlike' if p['liked'] else 'like','liked' if p['liked'] else '', '♥' if p['liked'] else '♡','Nodded' if p['liked'] else 'Nod',p['id'])
+            _rc=react_counts.get(p['id'],{})
+            _my=my_react.get(p['id'])
+            content+='<div class="reaction-bar">'
+            for _k in REACTION_KINDS:
+                _n=_rc.get(_k,0)
+                if _k=='nod':
+                    _n+=p['likes']
+                content+='<form method="post" action="/react">%s<input type="hidden" name="post_id" value="%s"><input type="hidden" name="kind" value="%s"><button class="%s">%s %s%s</button></form>'%(form_csrf(user),p['id'],_k,'on' if _my==_k or (_k=='nod' and p['liked']) else '',REACTION_EMOJI[_k],REACTION_LABELS[_k],' %s'%_n if _n else '')
+            content+='</div>'
+            content+='<p class="muted">%s nod(s) · <a href="/post/%s">%s comments</a></p><div class="actions"><a class="btn light" href="/post/%s">Comment</a><form method="post" action="/repost">%s<input type="hidden" name="post_id" value="%s"><input name="comment" maxlength="500" placeholder="Add a comment (optional)"><button class="light">Repost</button></form><form method="post" action="/save">%s<input type="hidden" name="post_id" value="%s"><button class="light">%s</button></form>%s</div></article>'%(p['likes'],p['id'],p['comments'],p['id'],form_csrf(user),p['id'],form_csrf(user),p['id'],'Saved ✓' if p['id'] in saved_ids else 'Save',('<form method="post" action="/pin">%s<input type="hidden" name="post_id" value="%s"><button class="light">%s</button></form>'%(form_csrf(user),p['id'],'Unpin' if p['is_pinned'] else 'Pin') if p['user_id']==user['id'] else ''))
         if page or has_more:
             content+='<div class="row">'
-            if page:content+='<a class="btn light" href="/?sort=%s&amp;page=%s">← Newer posts</a>'%(sort,max(0,page-1))
-            if has_more:content+='<a class="btn grow" href="/?sort=%s&amp;page=%s">Older posts →</a>'%(sort,page+1)
+            if page:content+='<a class="btn light" href="/?sort=%s&amp;feed=%s&amp;page=%s">← Newer posts</a>'%(sort,feed_mode,max(0,page-1))
+            if has_more:content+='<a class="btn grow" href="/?sort=%s&amp;feed=%s&amp;page=%s">Older posts →</a>'%(sort,feed_mode,page+1)
             content+='</div>'
         friends_panel='<aside class="rail card"><h2>Friends</h2>'
         if friends:
@@ -888,6 +1062,209 @@ class Handler(BaseHTTPRequestHandler):
         friends_panel+='</div>'
         layout='<div class="layout"><aside class="side"><a href="/">⌂ Feed</a><a href="/people">♧ People</a><a href="/friends">♧ Friends</a><a href="/messages">✉ Messages</a><a href="/notifications">♢ Notifications</a><a href="/profile">◉ Profile</a></aside><section>%s</section>%s</div>'%(content,friends_panel+'</aside>')
         return self.html(shell('Feed',layout,user))
+    def poll_html(self,user,post_id):
+        with connect() as c:
+            poll=c.execute('SELECT * FROM polls WHERE post_id=?',(post_id,)).fetchone()
+            if not poll:
+                return ''
+            opts=c.execute('SELECT o.*, (SELECT COUNT(*) FROM poll_votes v WHERE v.option_id=o.id) votes FROM poll_options o WHERE o.poll_id=? ORDER BY o.id',(poll['id'],)).fetchall()
+            total=sum(o['votes'] for o in opts)
+            my=c.execute('SELECT option_id FROM poll_votes WHERE poll_id=? AND user_id=?',(poll['id'],user['id'])).fetchone()
+        out='<div class="poll-box"><b>Poll: %s</b>'%(esc(poll['question']))
+        if my:
+            out+='<br><small>by the post author · %s vote(s)</small>'%total
+        if my:
+            for o in opts:
+                pct=round(o['votes']/total*100) if total else 0
+                out+='<div>%s%s — %s vote(s) (%s%%)</div><div class="poll-bar"><i style="width:%s%%"></i></div>'%('✓ ' if my['option_id']==o['id'] else '',esc(o['text']),o['votes'],pct,pct)
+            out+='<form method="post" action="/poll-vote">%s<input type="hidden" name="poll_id" value="%s"><label>Change your vote</label><select name="option_id">%s</select><button class="light">Change vote</button></form>'%(form_csrf(user),poll['id'],''.join('<option value="%s">%s</option>'%(o['id'],esc(o['text'])) for o in opts))
+        else:
+            out+='<form method="post" action="/poll-vote">%s<input type="hidden" name="poll_id" value="%s">'%(form_csrf(user),poll['id'])
+            for o in opts:
+                out+='<label class="row"><input type="radio" name="option_id" value="%s" required> %s</label>'%(o['id'],esc(o['text']))
+            out+='<button class="btn">Vote</button></form><p class="small">Results show after you vote.</p>'
+        out+='</div>'
+        return out
+    def post_card(self,user,p):
+        with connect() as c:
+            owner=user_by_id(c,p['user_id'])
+            likes=c.execute('SELECT COUNT(*) FROM likes WHERE post_id=?',(p['id'],)).fetchone()[0]
+        out='<article class="card"><div class="row">%s<div class="grow"><a href="/member/%s"><b>%s</b></a><time>%s</time></div></div>'%(avatar(owner),p['user_id'],esc(display(owner)),esc(date(p['created'])))
+        if p['original_post_id']:
+            with connect() as _c:
+                _orig=_c.execute('SELECT p.body,u.name,u.display_name FROM posts p JOIN users u ON u.id=p.user_id WHERE p.id=?',(p['original_post_id'],)).fetchone()
+            if _orig:
+                out+='<div class="repost-quote"><b>Reposted from %s</b><div class="post">%s</div></div>'%(esc(display(_orig)),render_body(_orig['body']))
+        if p['body']:out+='<div class="post">%s</div>'%render_body(p['body'])
+        if p['media_key']:
+            if (p['media_type'] or '').startswith('video/'):out+='<video class="media" controls playsinline src="/media/%s"></video>'%urllib.parse.quote(p['media_key'])
+            else:out+='<img class="media" loading="lazy" src="/media/%s" alt="Post photo">'%urllib.parse.quote(p['media_key'])
+        if p['spotify_track_id']:out+='<div class="spotify-note"><a href="https://open.spotify.com/track/%s" target="_blank" rel="noopener">♫ Listen on Spotify</a>%s</div>'%(esc(p['spotify_track_id']),spotify_embed_html(p['spotify_track_id']))
+        out+=self.poll_html(user,p['id'])
+        out+='<p class="muted">%s nod(s)</p><p><a class="btn light" href="/post/%s">Open post</a></p></article>'%(likes,p['id'])
+        return out
+    def explore(self,user):
+        with connect() as c:
+            trending=trending_posts(c,user['id'],20)
+            tags=c.execute('''SELECT h.tag,COUNT(*) n FROM post_hashtags ph JOIN hashtags h ON h.id=ph.hashtag_id JOIN posts p ON p.id=ph.post_id WHERE p.created>? GROUP BY h.tag ORDER BY n DESC LIMIT 10''',(time.time()-7*86400,)).fetchall()
+            suggested=c.execute('''SELECT u.* FROM users u WHERE u.id<>? AND u.id NOT IN (SELECT CASE WHEN f.requester_id=? THEN f.addressee_id ELSE f.requester_id END FROM friendships f WHERE (f.requester_id=? OR f.addressee_id=?) AND f.status='accepted') AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.blocker_id=? AND b.blocked_id=u.id) OR (b.blocker_id=u.id AND b.blocked_id=?)) ORDER BY u.last_seen DESC LIMIT 6''',(user['id'],user['id'],user['id'],user['id'],user['id'],user['id'])).fetchall()
+            new_groups=c.execute('SELECT * FROM groups ORDER BY created DESC LIMIT 6').fetchall()
+        content='<section class="card quad-hero"><span class="eyebrow">Explore</span><h2>Around the Quad</h2><p>What is trending, what people are talking about, and who is new here.</p></section>'
+        content+='<section class="card"><h2>Search posts &amp; people</h2><form method="get" action="/search"><input name="q" placeholder="Search posts, hashtags, people"><button class="btn">Search</button></form><p class="small">Search respects privacy — private posts never show to non-friends.</p></section>'
+        content+='<section class="card"><h2>Trending hashtags</h2>'
+        if tags:
+            for t in tags:content+='<a class="tag-chip" href="/tag/%s">#%s · %s</a>'%(esc(t['tag']),esc(t['tag']),t['n'])
+        else:content+='<p class="small">No hashtags yet — be the first to add one to a post.</p>'
+        content+='</section><section class="card"><h2>Suggested people</h2>'
+        if suggested:
+            for m in suggested:content+='<div class="person">%s<a class="grow" href="/member/%s"><b>%s</b></a><form method="post" action="/friend">%s<input type="hidden" name="user_id" value="%s"><input type="hidden" name="action" value="request"><button>Add friend</button></form></div>'%(avatar(m),m['id'],esc(display(m)),form_csrf(user),m['id'])
+        else:content+='<p class="small">No suggestions right now.</p>'
+        content+='</section><section class="card"><h2>New groups</h2>'
+        if new_groups:
+            for g in new_groups:content+='<div class="person"><div class="grow"><a href="/group/%s"><b>%s</b></a><p class="small">%s · %s</p></div></div>'%(g['id'],esc(g['name']),esc(g['visibility']),esc(g['description'][:120]))
+        else:content+='<p class="small">No groups yet. <a href="/groups">Create the first one</a>.</p>'
+        content+='</section><h2>Trending posts</h2>'
+        if not trending:content+='<section class="card">Nothing trending yet — post something and get the conversation going.</section>'
+        for _score,p in trending:content+=self.post_card(user,p)
+        return self.html(shell('Explore',content,user))
+    def search_page(self,user,q=''):
+        q=(q or '').strip()[:120]
+        content='<section class="card"><h1>Search</h1><form method="get" action="/search"><input name="q" value="%s" placeholder="Search posts, hashtags, people"><button class="btn">Search</button></form></section>'%esc(q)
+        if q:
+            with connect() as c:
+                posts=search_posts(c,user['id'],q,50)
+                term='%'+escape_like(q)+'%'
+                people=c.execute("SELECT * FROM users WHERE id<>? AND (name LIKE ? OR COALESCE(display_name,'') LIKE ?) AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.blocker_id=? AND b.blocked_id=id) OR (b.blocker_id=id AND b.blocked_id=?)) ORDER BY last_seen DESC LIMIT 20",(user['id'],term,term,user['id'],user['id'])).fetchall()
+            content+='<h2>Posts matching “%s” · %s</h2>'%(esc(q),len(posts))
+            if not posts:content+='<section class="card">No posts matched that search.</section>'
+            for p in posts:content+=self.post_card(user,p)
+            content+='<h2>People matching “%s”</h2>'%esc(q)
+            if not people:content+='<section class="card">No people matched that search.</section>'
+            for m in people:content+='<div class="person">%s<a class="grow" href="/member/%s"><b>%s</b></a></div>'%(avatar(m),m['id'],esc(display(m)))
+        return self.html(shell('Search',content,user))
+    def tag_page(self,user,tag=''):
+        tag=(tag or '').strip().lower()[:50]
+        with connect() as c:
+            rows=c.execute('''SELECT p.* FROM post_hashtags ph JOIN hashtags h ON h.id=ph.hashtag_id JOIN posts p ON p.id=ph.post_id WHERE h.tag=? AND p.is_hidden=0 AND p.group_id IS NULL ORDER BY p.created DESC LIMIT 50''',(tag,)).fetchall()
+            posts=[p for p in rows if can_view_repost(c,user['id'],p)]
+        content='<section class="card"><h1>#%s</h1><p>%s post(s) with this hashtag.</p><p><a href="/explore">← Back to Explore</a></p></section>'%(esc(tag),len(posts))
+        if not posts:content+='<section class="card">No posts with this hashtag yet.</section>'
+        for p in posts:content+=self.post_card(user,p)
+        return self.html(shell('#'+tag,content,user))
+    def saved_page(self,user):
+        with connect() as c:
+            rows=c.execute('''SELECT p.* FROM saved_posts s JOIN posts p ON p.id=s.post_id WHERE s.user_id=? AND p.is_hidden=0 ORDER BY s.created DESC LIMIT 50''',(user['id'],)).fetchall()
+            posts=[p for p in rows if can_view_repost(c,user['id'],p)]
+        content='<section class="card"><h1>Saved posts</h1><p>Posts you saved for later.</p></section>'
+        if not posts:content+='<section class="card">Nothing saved yet. Tap Save on a post to keep it here.</section>'
+        for p in posts:content+=self.post_card(user,p)
+        return self.html(shell('Saved posts',content,user))
+    def groups_page(self,user):
+        with connect() as c:
+            groups=c.execute('SELECT g.*,(SELECT COUNT(*) FROM group_members m WHERE m.group_id=g.id AND m.status=\'accepted\') members FROM groups g ORDER BY g.created DESC').fetchall()
+            mine={r['group_id']:r for r in c.execute('SELECT * FROM group_members WHERE user_id=?',(user['id'],)).fetchall()}
+        content='<section class="card"><h1>Groups</h1><p>A group is a Quad — a place for a specific circle of people. Public groups are open to everyone; private groups need a member to approve you.</p></section>'
+        content+='<section class="card"><h2>Create a group</h2><form method="post" action="/group">%s<label>Group name</label><input name="name" required maxlength="80" placeholder="e.g. Dorm 4B"><label>Description</label><textarea name="description" maxlength="500" placeholder="What is this group for?"></textarea><label>Visibility</label><select name="visibility"><option value="public">Public — anyone can join and see posts</option><option value="private">Private — members only, join by request</option></select><button class="btn">Create group</button></form></section>'%form_csrf(user)
+        for g in groups:
+            if g['visibility']=='private' and g['id'] not in mine and g['owner_id']!=user['id']:
+                content+='<article class="card"><h2>%s 🔒</h2><p class="small">Private group · %s member(s)</p><p>This group is private. You need to be a member to see its posts.</p></article>'%(esc(g['name']),g['members'])
+                continue
+            mem=mine.get(g['id'])
+            btn=''
+            if mem and mem['status']=='accepted':btn='<a class="btn light" href="/group/%s">Open group</a>'%g['id']
+            elif mem and mem['status']=='pending':btn='<span class="muted">Join request pending</span>'
+            elif g['visibility']=='public':btn='<form method="post" action="/group-action">%s<input type="hidden" name="group_id" value="%s"><input type="hidden" name="action" value="join"><button>Join group</button></form>'%(form_csrf(user),g['id'])
+            else:btn='<form method="post" action="/group-action">%s<input type="hidden" name="group_id" value="%s"><input type="hidden" name="action" value="request"><button>Request to join</button></form>'%(form_csrf(user),g['id'])
+            content+='<article class="card"><h2><a href="/group/%s">%s</a></h2><p>%s</p><p class="small">%s · %s member(s) · created %s</p>%s</article>'%(g['id'],esc(g['name']),esc(g['description']),esc(g['visibility']),g['members'],esc(date(g['created'])),btn)
+        if not groups:content+='<section class="card">No groups yet — create the first one above.</section>'
+        return self.html(shell('Groups',content,user))
+    def group_page(self,user,gid):
+        with connect() as c:
+            g=c.execute('SELECT * FROM groups WHERE id=?',(gid,)).fetchone()
+            if not g:return self.html(shell('Group','<section class="card">Group not found.</section>',user),404)
+            mem=group_role(c,gid,user['id'])
+            is_member=bool(mem and mem['status']=='accepted') or g['owner_id']==user['id']
+            if g['visibility']=='private' and not is_member:
+                content='<section class="card"><h1>%s 🔒</h1><p>This group is private.</p>'%esc(g['name'])
+                if mem and mem['status']=='pending':content+='<p class="muted">Your join request is pending.</p>'
+                else:content+='<form method="post" action="/group-action">%s<input type="hidden" name="group_id" value="%s"><input type="hidden" name="action" value="request"><button>Request to join</button></form>'%(form_csrf(user),gid)
+                return self.html(shell('Group',content+'</section>',user))
+            members=c.execute('SELECT u.*,m.role FROM group_members m JOIN users u ON u.id=m.user_id WHERE m.group_id=? AND m.status=\'accepted\' ORDER BY m.role,m.created',(gid,)).fetchall()
+            pending=c.execute('SELECT u.*,m.created FROM group_members m JOIN users u ON u.id=m.user_id WHERE m.group_id=? AND m.status=\'pending\' ORDER BY m.created',(gid,)).fetchall()
+            posts=c.execute('SELECT * FROM posts WHERE group_id=? AND is_hidden=0 ORDER BY created DESC LIMIT 30',(gid,)).fetchall()
+            events=c.execute('SELECT * FROM events WHERE group_id=? AND starts_at>? ORDER BY starts_at LIMIT 10',(gid,time.time())).fetchall()
+            owner=user_by_id(c,g['owner_id'])
+        is_admin=is_member and (g['owner_id']==user['id'] or (mem and mem['role'] in ('owner','admin')))
+        content='<section class="card"><h1>%s</h1><p>%s</p><p class="small">%s group · %s member(s) · owner %s</p>'%(esc(g['name']),esc(g['description']),esc(g['visibility']),len(members),esc(display(owner)))
+        if is_member:
+            content+='<form method="post" action="/group-action">%s<input type="hidden" name="group_id" value="%s"><input type="hidden" name="action" value="leave"><button class="light">Leave group</button></form>'%(form_csrf(user),gid)
+        content+='</section>'
+        if is_admin and pending:
+            content+='<section class="card"><h2>Join requests</h2>'
+            for m in pending:
+                content+='<div class="person">%s<b class="grow">%s</b><form method="post" action="/group-action">%s<input type="hidden" name="group_id" value="%s"><input type="hidden" name="action" value="approve"><input type="hidden" name="user_id" value="%s"><button>Approve</button></form><form method="post" action="/group-action">%s<input type="hidden" name="group_id" value="%s"><input type="hidden" name="action" value="reject"><input type="hidden" name="user_id" value="%s"><button class="light">Reject</button></form></div>'%(avatar(m),esc(display(m)),form_csrf(user),gid,m['id'],form_csrf(user),gid,m['id'])
+            content+='</section>'
+        content+='<section class="card"><h2>Members</h2>'
+        for m in members:
+            role_btn=''
+            if is_admin and m['id']!=g['owner_id'] and m['id']!=user['id']:
+                role_btn='<form method="post" action="/group-action">%s<input type="hidden" name="group_id" value="%s"><input type="hidden" name="action" value="%s"><input type="hidden" name="user_id" value="%s"><button class="light">%s</button></form>'%(form_csrf(user),gid,'demote' if m['role']=='admin' else 'promote',m['id'],'Demote to member' if m['role']=='admin' else 'Make admin')
+            content+='<div class="person">%s<b class="grow">%s · %s</b>%s</div>'%(avatar(m),esc(display(m)),esc(m['role']),role_btn)
+        content+='</section>'
+        if events:
+            content+='<section class="card"><h2>Upcoming events</h2>'
+            for e in events:content+='<div class="person"><div class="grow"><b>%s</b><p class="small">%s · %s</p></div><a class="btn light" href="/events">RSVP</a></div>'%(esc(e['title']),esc(date(e['starts_at'])),esc(e['location']))
+            content+='</section>'
+        if is_member:
+            content+='<section class="card"><h2>Post in this group</h2><form method="post" action="/group-post" enctype="multipart/form-data">%s<input type="hidden" name="group_id" value="%s"><textarea name="body" maxlength="2000" required placeholder="Share something with %s"></textarea><button class="btn">Post to group</button></form><p class="small">Group posts only show inside this group — never on the main feed.</p></section>'%(form_csrf(user),gid,esc(g['name']))
+        content+='<h2>Group discussion</h2>'
+        if not posts:content+='<section class="card">No posts in this group yet.</section>'
+        for p in posts:content+=self.post_card(user,p)
+        return self.html(shell('Group',content,user))
+    def events_page(self,user):
+        with connect() as c:
+            events=c.execute('SELECT e.*,u.name,u.display_name FROM events e JOIN users u ON u.id=e.user_id WHERE e.starts_at>? ORDER BY e.starts_at LIMIT 30',(time.time(),)).fetchall()
+            groups=c.execute('SELECT * FROM groups ORDER BY name').fetchall()
+            friends=c.execute("SELECT u.* FROM friendships f JOIN users u ON u.id=CASE WHEN f.requester_id=? THEN f.addressee_id ELSE f.requester_id END WHERE (f.requester_id=? OR f.addressee_id=?) AND f.status='accepted' ORDER BY u.display_name,u.name",(user['id'],user['id'],user['id'])).fetchall()
+            rsvps={r['event_id']:r['status'] for r in c.execute('SELECT * FROM event_rsvps WHERE user_id=?',(user['id'],)).fetchall()}
+        content='<section class="card"><h1>Events</h1><p>Upcoming events, with RSVPs and invitations to friends.</p></section>'
+        content+='<section class="card"><h2>Create an event</h2><form method="post" action="/event">%s<label>Title</label><input name="title" required maxlength="120"><label>Description</label><textarea name="description" maxlength="500"></textarea><label>When</label><input type="datetime-local" name="starts_at" required><label>Where</label><input name="location" maxlength="120" placeholder="e.g. The Quad, Dorm 4B"><label>Group (optional)</label><select name="group_id"><option value="">No group — open event</option>%s</select><button class="btn">Create event</button></form></section>'%(form_csrf(user),''.join('<option value="%s">%s</option>'%(g['id'],esc(g['name'])) for g in groups))
+        for e in events:
+            my=rsvps.get(e['id'],'')
+            content+='<article class="card"><h2>%s</h2><p>%s</p><p class="small">%s · %s · by %s</p><p class="small">Your RSVP: <b>%s</b></p><form method="post" action="/event-rsvp">%s<input type="hidden" name="event_id" value="%s"><select name="status"><option value="going" %s>Going</option><option value="maybe" %s>Maybe</option><option value="not_going" %s>Not going</option></select><button class="light">Save RSVP</button></form>'%(esc(e['title']),esc(e['description']),esc(date(e['starts_at'])),esc(e['location']),esc(display(e)),esc(my or 'not set'),form_csrf(user),e['id'],'selected' if my=='going' else '','selected' if my=='maybe' else '','selected' if my=='not_going' else '')
+            if friends:
+                content+='<form method="post" action="/event-invite">%s<input type="hidden" name="event_id" value="%s"><select name="friend_id">%s</select><button class="light">Invite friend</button></form>'%(form_csrf(user),e['id'],''.join('<option value="%s">%s</option>'%(f['id'],esc(display(f))) for f in friends))
+            content+='</article>'
+        if not events:content+='<section class="card">No upcoming events — create the first one above.</section>'
+        return self.html(shell('Events',content,user))
+    def moderation_page(self,user):
+        if not user['is_admin']:return self.html(shell('Moderation','<section class="card"><h1>Admin access only</h1></section>',user),403)
+        with connect() as c:
+            reports=c.execute('SELECT r.*,u.name,u.display_name FROM reports r JOIN users u ON u.id=r.reporter_id ORDER BY r.created DESC LIMIT 100').fetchall()
+        content='<section class="card"><h1>Moderation queue</h1><p>Reports from members, newest first. Hiding removes a post from feeds and search; removing deletes it; warning notifies the person who posted it. Every action is audit-logged and the reporter is notified of the outcome.</p></section>'
+        if not reports:content+='<section class="card">No reports. The queue is clear.</section>'
+        for r in reports:
+            content+='<article class="card"><h2>Report #%s · %s · %s</h2><p><b>Reason:</b> %s</p><p>%s</p><p class="small">Reported by %s · %s · status: <b>%s</b></p>'%(r['id'],esc(r['target_type']),esc(r['target_id']),esc(r['reason']),esc(r['details']),esc(display(r)),esc(date(r['created'])),esc(r['status']))
+            if r['status']=='open':
+                content+='<form method="post" action="/admin/report-action">%s<input type="hidden" name="report_id" value="%s"><select name="action"><option value="hide">Hide target</option><option value="remove">Remove target</option><option value="warn">Warn the person</option><option value="dismiss">Dismiss (no violation)</option></select><button class="danger">Take action</button></form>'%(form_csrf(user),r['id'])
+            content+='</article>'
+        return self.html(shell('Moderation',content,user))
+    def export_data(self,user):
+        with connect() as c:
+            u=user_by_id(c,user['id'])
+            data={
+                'exported_at':time.time(),'user':{'id':u['id'],'name':u['name'],'display_name':u['display_name'],'email':u['email'],'bio':u['bio'],'interests':u['interests'],'joined':u['joined']},
+                'posts':[dict(r) for r in c.execute('SELECT * FROM posts WHERE user_id=? ORDER BY created',(user['id'],)).fetchall()],
+                'comments':[dict(r) for r in c.execute('SELECT * FROM comments WHERE user_id=? ORDER BY created',(user['id'],)).fetchall()],
+                'messages':[dict(r) for r in c.execute('SELECT * FROM messages WHERE sender_id=? OR recipient_id=? ORDER BY created',(user['id'],user['id'])).fetchall()],
+                'likes':[dict(r) for r in c.execute('SELECT * FROM likes WHERE user_id=?',(user['id'],)).fetchall()],
+                'reactions':[dict(r) for r in c.execute('SELECT * FROM reactions WHERE user_id=?',(user['id'],)).fetchall()],
+                'saved_posts':[dict(r) for r in c.execute('SELECT * FROM saved_posts WHERE user_id=?',(user['id'],)).fetchall()],
+                'listening_notes':[dict(r) for r in c.execute('SELECT * FROM listening_notes WHERE user_id=?',(user['id'],)).fetchall()],
+                'groups':[dict(r) for r in c.execute('SELECT g.* FROM groups g JOIN group_members m ON m.group_id=g.id WHERE m.user_id=?',(user['id'],)).fetchall()],
+            }
+        body=json.dumps(data,ensure_ascii=False,indent=2).encode('utf-8')
+        self.send_response(200);self.send_header('Content-Type','application/json; charset=utf-8');self.send_header('Content-Disposition','attachment; filename="the-quad-export.json"');self.send_header('Content-Length',str(len(body)));self.security_headers();self.end_headers();self.wfile.write(body)
     def profile(self,user):
         with connect() as c:
             u=user_by_id(c,user['id'])
@@ -909,12 +1286,45 @@ class Handler(BaseHTTPRequestHandler):
         if p['music_track'] and p['music_track'] in MUSIC_TRACKS:content+='<div class="music-bar"><button type="button" data-quad-track="%s">▶ Play</button><span class="small grow">%s · built-in loop</span></div>'%(esc(p['music_track']),esc(MUSIC_TRACKS[p['music_track']]))
         if p['spotify_track_id']:content+='<div class="spotify-note"><a href="https://open.spotify.com/track/%s" target="_blank" rel="noopener">♫ Listen on Spotify</a>%s</div>'%(esc(p['spotify_track_id']),spotify_embed_html(p['spotify_track_id']))
         content+='<p class="muted">%s nod(s) · %s comment(s)</p><div class="actions"><form method="post" action="/like">%s<input type="hidden" name="post_id" value="%s"><input type="hidden" name="action" value="%s"><button class="%s">%s %s</button></form></div></article>'%(p['likes'],len(comments),form_csrf(user),pid,'unlike' if p['liked'] else 'like','liked' if p['liked'] else '','♥' if p['liked'] else '♡','Nodded' if p['liked'] else 'Nod')
+        content+=self.poll_html(user,pid)
+        if p['user_id']==user['id']:
+            with connect() as _c:
+                _has_poll=_c.execute('SELECT 1 FROM polls WHERE post_id=?',(pid,)).fetchone()
+            if not _has_poll:
+                content+='<section class="card"><h2>Add a poll to this post</h2><form method="post" action="/poll">%s<input type="hidden" name="post_id" value="%s"><label>Question</label><input name="question" required maxlength="200" placeholder="What should we do?"><label>Options — one per line, 2–5</label><textarea name="options" required placeholder="Option one\nOption two"></textarea><button class="btn">Add poll</button></form></section>'%(form_csrf(user),pid)
+        content+='<section class="card"><h2>Report this post</h2><form method="post" action="/report">%s<input type="hidden" name="target_type" value="post"><input type="hidden" name="target_id" value="%s"><label>Reason</label><input name="reason" required maxlength="80" placeholder="e.g. Spam, harassment, inappropriate"><label>Details (optional)</label><input name="details" maxlength="500"><button class="light">Report post</button></form></section>'%(form_csrf(user),pid)
         content+='<section class="card"><h2>Discussion</h2>'
+        # Threaded replies, depth capped at 2: a reply's parent must be a
+        # top-level comment. Render replies indented under their parent.
+        tops=[cm for cm in comments if not cm['parent_id']]
+        replies={}
         for cm in comments:
-            content+='<div class="comment"><div class="row">%s<a class="grow" href="/member/%s"><b>%s</b></a><time>%s</time>'%(avatar(cm,32),cm['user_id'],esc(display(cm)),esc(date(cm['created'])))
+            if cm['parent_id']:
+                replies.setdefault(cm['parent_id'],[]).append(cm)
+        with connect() as _c:
+            _cr={r['comment_id']:r for r in _c.execute('SELECT comment_id,kind,COUNT(*) n FROM comment_reactions WHERE comment_id IN (SELECT id FROM comments WHERE post_id=?) GROUP BY comment_id,kind',(pid,)).fetchall()} if comments else {}
+            _my_cr={r['comment_id']:r['kind'] for r in _c.execute('SELECT comment_id,kind FROM comment_reactions WHERE user_id=? AND comment_id IN (SELECT id FROM comments WHERE post_id=?)',(user['id'],pid)).fetchall()} if comments else {}
+        def _comment_html(cm, indented=False):
+            _cls='comment thread-reply' if indented else 'comment'
+            _h='<div class="%s"><div class="row">%s<a class="grow" href="/member/%s"><b>%s</b></a><time>%s</time>'%(_cls,avatar(cm,32),cm['user_id'],esc(display(cm)),esc(date(cm['created'])))
             if cm['user_id']==user['id'] or p['user_id']==user['id'] or user['is_admin']:
-                content+='<form method="post" action="/delete-comment">%s<input type="hidden" name="comment_id" value="%s"><button class="danger">Remove</button></form>'%(form_csrf(user),cm['id'])
-            content+='</div><p>%s</p></div>'%esc(cm['body'])
+                _h+='<form method="post" action="/delete-comment">%s<input type="hidden" name="comment_id" value="%s"><button class="danger">Remove</button></form>'%(form_csrf(user),cm['id'])
+            _h+='</div><p>%s</p>'%esc(cm['body'])
+            _h+='<div class="reaction-bar">'
+            for _k in REACTION_KINDS:
+                _n=0
+                _h+='<form method="post" action="/comment-react">%s<input type="hidden" name="comment_id" value="%s"><input type="hidden" name="kind" value="%s"><button class="%s">%s %s</button></form>'%(form_csrf(user),cm['id'],_k,'on' if _my_cr.get(cm['id'])==_k else '',REACTION_EMOJI[_k],REACTION_LABELS[_k])
+            _h+='</div>'
+            if cm['user_id']==user['id']:
+                _h+='<form method="post" action="/edit-comment">%s<input type="hidden" name="comment_id" value="%s"><input name="body" value="%s" maxlength="1000" required><button class="light">Edit comment</button></form>'%(form_csrf(user),cm['id'],esc(cm['body']))
+            if not indented:
+                _h+='<form method="post" action="/comment">%s<input type="hidden" name="post_id" value="%s"><input type="hidden" name="parent_id" value="%s"><input name="body" required maxlength="1000" placeholder="Reply to %s"><button class="light">Reply</button></form>'%(form_csrf(user),pid,cm['id'],esc(display(cm)))
+            _h+='</div>'
+            return _h
+        for cm in tops:
+            content+=_comment_html(cm)
+            for rep in replies.get(cm['id'],[]):
+                content+=_comment_html(rep, indented=True)
         content+='<form class="comment-form" method="post" action="/comment">%s<input type="hidden" name="post_id" value="%s"><textarea name="body" required maxlength="1000" placeholder="Add to the conversation"></textarea><button>Comment</button></form></section><p><a href="/">← Back to feed</a></p>'%(form_csrf(user),pid)
         return self.html(shell('Discussion',content,user))
     def people(self,user,q=''):
@@ -979,12 +1389,22 @@ class Handler(BaseHTTPRequestHandler):
     def notifications(self,user):
         with connect() as c:
             rows=c.execute('SELECT n.*,u.name,u.display_name,u.avatar_key FROM notifications n LEFT JOIN users u ON u.id=n.actor_id WHERE n.user_id=? ORDER BY n.created DESC LIMIT 100',(user['id'],)).fetchall()
-            c.execute('UPDATE notifications SET read_at=? WHERE user_id=? AND read_at IS NULL',(time.time(),user['id']))
-        content='<section class="card"><h1>Notifications</h1>'
+        content='<section class="card"><h1>Notifications</h1><form method="post" action="/notifications/read-all">%s<button class="light">Mark all as read</button></form><p class="small">Notifications from the same person about the same thing within an hour are grouped together. Choose which kinds you get in <a href="/settings">Settings</a>.</p>'%form_csrf(user)
         if not rows:content+='<p>You are all caught up.</p>'
+        # Group by (actor, kind, target) within the last hour.
+        grouped=[]
         for n in rows:
-            dest='/friends' if n['kind'] in ('friend_request','friend_accept') else ('/messages?with=%s'%n['actor_id'] if n['kind']=='message' else ('/post/%s'%esc(n['target_id']) if n['kind'] in ('like','comment') and n['target_id'] else '/'))
-            content+='<a class="person %s" href="%s">%s<div><b>%s</b> %s<time>%s</time></div></a>'%('unread' if not n['read_at'] else '',dest,avatar(n),esc(n['display_name'] or n['name'] or 'The Quad'),esc(n['body']),esc(date(n['created'])))
+            if grouped:
+                g=grouped[-1]
+                if g['actor_id']==n['actor_id'] and g['kind']==n['kind'] and g['target_id']==n['target_id'] and g['created']-n['created']<=3600:
+                    g['count']+=1;g['unread']=g['unread'] or not n['read_at'];continue
+            grouped.append(dict(n));grouped[-1]['count']=1;grouped[-1]['unread']=not n['read_at']
+        for n in grouped:
+            dest='/friends' if n['kind'] in ('friend_request','friend_accept') else ('/messages?with=%s'%n['actor_id'] if n['kind']=='message' else ('/post/%s'%esc(n['target_id']) if n['kind'] in ('like','comment','repost','reaction') and n['target_id'] and str(n['target_id']).isdigit() else ('/groups' if n['kind']=='group_invite' else ('/events' if n['kind'] in ('event_invite','event_reminder') else '/'))))
+            label='%s %s'%(esc(n['display_name'] or n['name'] or 'The Quad'),esc(n['body']))
+            if n['count']>1:
+                label+=' <span class="badge">×%s</span>'%n['count']
+            content+='<a class="person %s" href="%s">%s<div><b>%s</b><time>%s</time></div></a>'%('unread' if n['unread'] else '',dest,avatar(n),label,esc(date(n['created'])))
         return self.html(shell('Notifications',content+'</section>',user))
     def listening_refresh(self,user):
         # Stub, deliberately unimplemented: there are no Spotify credentials
@@ -1012,6 +1432,21 @@ class Handler(BaseHTTPRequestHandler):
         if not blocked: content+='<p class="muted">You have not blocked anyone.</p>'
         for m in blocked: content+='<div class="person">%s<b class="grow">%s</b><form method="post" action="/block">%s<input type="hidden" name="user_id" value="%s"><input type="hidden" name="action" value="unblock"><button class="light">Unblock</button></form></div>'%(avatar(m),esc(display(m)),form_csrf(user),m['id'])
         content+='<section class="card"><h2>Change password</h2><p><a class="btn light" href="/change-password">Change your password</a></p></section><section class="card"><h2>Password recovery</h2><p>If you forget your password, the app can email a six-digit reset code. SMTP email delivery must be configured on the server for this feature to send mail.</p></section>'
+        # Notification preferences (Update 6): per-kind on/off, in-app only.
+        # Push notifications are NOT offered — they need a service worker,
+        # VAPID keys and a push sender this server does not have.
+        with connect() as _c:
+            _prefs={r['kind']:r['enabled'] for r in _c.execute('SELECT kind,enabled FROM notification_prefs WHERE user_id=?',(user['id'],)).fetchall()}
+        content+='<section class="card"><h2>Notification preferences</h2><p class="small">Choose which in-app notifications you get. Push notifications are not available — The Quad does not have a push service set up.</p><form method="post" action="/notification-prefs">%s'%form_csrf(user)
+        for _k in NOTIF_KINDS:
+            _on=_prefs.get(_k,1)
+            content+='<label class="row"><input type="checkbox" name="pref_%s"%s><span>%s</span></label>'%(_k,' checked' if _on else '',esc(_k.replace('_',' ')))
+        content+='<button class="btn">Save notification preferences</button></form></section>'
+        content+='<section class="card"><h2>Your data</h2><p>Download everything you have posted, commented and messaged as JSON. It only includes your own messages — never anyone else\'s private messages.</p><p><a class="btn light" href="/export-data">Download my data (JSON)</a></p></section>'
+        if not user['is_admin']:
+            content+='<section class="card"><h2>Delete my account</h2><p>Deleting your account removes your profile, posts, comments and messages. It is reversible for 30 days — an admin can restore it from the admin panel in that window. After 30 days the saved copy is deleted. To delete, type your email address and enter your current password.</p><form method="post" action="/account/delete" data-confirm="Delete your account? This can be restored by an admin for 30 days.">%s<label>Type your email to confirm</label><input type="email" name="confirm_email" required maxlength="254"><label>Current password</label><input type="password" name="password" required><button class="danger">Delete my account</button></form></section>'%form_csrf(user)
+        else:
+            content+='<section class="card"><h2>Delete my account</h2><p class="small">Admin accounts cannot be deleted here — another admin would need to remove the account from the admin panel.</p></section>'
         content+='<section class="card"><h2>Spotify — live now-playing</h2><p><b>Live Spotify sync is not set up yet.</b> Your Listening Note is set by hand and lasts 24 hours — that works now, no Spotify account needed.</p><p>To show what you are actually listening to in real time, The Quad would need: a Spotify developer app configured on the server, each person linking their own Spotify account, and permission to read what they are currently playing (<code>user-read-currently-playing</code>). No Spotify tokens are stored by The Quad today, and nothing here claims to be connected.</p><p><a class="btn light" href="/notes/refresh">Check live now-playing status</a></p></section>'
         content+='<section class="card"><h2>Block someone</h2><form method="get" action="/people"><label>Find a member</label><input name="q" placeholder="Search by name"><button class="light">Open People</button></form></section>'
         return self.html(shell('Settings',content,user))
@@ -1021,12 +1456,18 @@ class Handler(BaseHTTPRequestHandler):
         with connect() as c:
             m=user_by_id(c,uid)
             if m and not can_view_post(c,user['id'],uid):return self.html(shell('Member','<section class="card">This profile is private or unavailable.</section>',user),403)
-            posts=c.execute('SELECT * FROM posts WHERE user_id=? ORDER BY created DESC LIMIT 20',(uid,)).fetchall() if m else []
+            posts=c.execute('SELECT * FROM posts WHERE user_id=? AND is_hidden=0 ORDER BY created DESC LIMIT 20',(uid,)).fetchall() if m else []
             member_note=visible_listening_note(c,user['id'],uid) if m else None
         if not m:return self.html(shell('Profile','<section class="card">Member not found.</section>',user),404)
         content='<section class="card">%s<h1>%s</h1><p>%s</p><p><b>Interests:</b> %s</p></section>'%(avatar(m,90),esc(display(m)),esc(m['bio']),esc(m['interests']))
         if member_note:content+='<section class="card"><h2>Listening Note</h2>%s</section>'%spotify_note_html(member_note, embed=True)
-        for p in posts:content+='<article class="card"><time>%s</time><p>%s</p></article>'%(esc(date(p['created'])),esc(p['body']))
+        pinned=[p for p in posts if p['is_pinned']]
+        if pinned:
+            content+='<section class="card"><h2>Pinned posts</h2></section>'
+            for p in pinned:content+=self.post_card(user,p)
+        for p in posts:
+            if p['is_pinned']:continue
+            content+='<article class="card"><time>%s</time><p>%s</p></article>'%(esc(date(p['created'])),render_body(p['body']))
         return self.html(shell('Member',content,user))
     def admin(self,user):
         if not user['is_admin']:return self.html(shell('Admin','<section class="card"><h1>Admin access only</h1></section>',user),403)
@@ -1049,7 +1490,7 @@ class Handler(BaseHTTPRequestHandler):
             shield=c.execute('SELECT action,COUNT(*) entries,SUM(request_count) total FROM rate_limits GROUP BY action ORDER BY total DESC LIMIT 10').fetchall()
             all_users=c.execute('SELECT id,name,display_name,email,is_admin,joined,last_seen FROM users ORDER BY joined LIMIT 100').fetchall()
         counts={r['hour_ago']:r['amount'] for r in hourly};peak=max(counts.values(),default=0)
-        content='<section class="card"><span class="eyebrow">PRIVATE ADMIN VIEW</span><h1>Admin dashboard</h1><p>Traffic is recorded as page and time only; the app does not retain raw visitor IP addresses. Active means seen in the last two minutes. Page-view logging is throttled to 20/minute per visitor, so traffic figures are approximate.</p><div class="shield"><h2>Traffic Shield — app level (measured by The Quad)</h2><p class="small">Rate limits are enforced in the app (posts 30/hour, comments 120/hour, messages 300/hour, logins 20/10 min, registrations 5/hour). Flooding is slowed or blocked before it can take the site down. Recent rate-limit windows below are keyed one-way identifiers only — no raw IPs are stored.</p><h2 class="shield-h2">Traffic Shield — Nginx level (configured, not measured)</h2><p class="small">Nginx sits in front of the app and blocks traffic before Python ever sees it, so its counts are <b>not visible in this panel</b>. These are the limits configured in nginx.conf.template, not live measurements: 20 requests/second per IP (burst 60), max 20 simultaneous connections per IP, max request body 27 MB, body timeout 30s, read/send timeout 60s, keep-alive 15s. If Nginx blocks someone, the app records nothing for that request.</p>'
+        content='<section class="card"><span class="eyebrow">PRIVATE ADMIN VIEW</span><h1>Admin dashboard</h1><p><a class="btn" href="/admin/moderation">Open moderation queue</a> <a class="btn light" href="/export-data">Download my data</a></p><p>Traffic is recorded as page and time only; the app does not retain raw visitor IP addresses. Active means seen in the last two minutes. Page-view logging is throttled to 20/minute per visitor, so traffic figures are approximate.</p><div class="shield"><h2>Traffic Shield — app level (measured by The Quad)</h2><p class="small">Rate limits are enforced in the app (posts 30/hour, comments 120/hour, messages 300/hour, logins 20/10 min, registrations 5/hour). Flooding is slowed or blocked before it can take the site down. Recent rate-limit windows below are keyed one-way identifiers only — no raw IPs are stored.</p><h2 class="shield-h2">Traffic Shield — Nginx level (configured, not measured)</h2><p class="small">Nginx sits in front of the app and blocks traffic before Python ever sees it, so its counts are <b>not visible in this panel</b>. These are the limits configured in nginx.conf.template, not live measurements: 20 requests/second per IP (burst 60), max 20 simultaneous connections per IP, max request body 27 MB, body timeout 30s, read/send timeout 60s, keep-alive 15s. If Nginx blocks someone, the app records nothing for that request.</p>'
         if shield:
             for row in shield:content+='<div class="table-row"><code>%s</code><span>%s windows · %s requests</span></div>'%(esc(row['action']),row['entries'],row['total'])
         else:content+='<p class="muted">No rate-limit activity recorded in the last 2 days.</p>'
@@ -1253,7 +1694,7 @@ class Handler(BaseHTTPRequestHandler):
                 c.execute('DELETE FROM sessions WHERE user_id=? AND token<>?',(user['id'],token))
                 audit_event(c,user['id'],'password_change','user',user['id'],{'forced':bool(user['must_change_password'])})
             return self.go('/')
-        write_limits={'/posts':(30,3600),'/comment':(120,3600),'/message':(300,3600),'/friend':(120,3600),'/block':(60,3600),'/like':(300,3600),'/profile':(30,3600),'/settings':(30,3600),'/delete':(120,3600),'/delete-comment':(120,3600),'/listening-note':(10,3600),'/admin/remove-user':(10,3600),'/admin/restore-user':(10,3600)}
+        write_limits={'/posts':(30,3600),'/comment':(120,3600),'/message':(300,3600),'/friend':(120,3600),'/block':(60,3600),'/like':(300,3600),'/react':(300,3600),'/comment-react':(300,3600),'/edit-comment':(120,3600),'/repost':(30,3600),'/save':(120,3600),'/pin':(60,3600),'/profile':(30,3600),'/settings':(30,3600),'/delete':(120,3600),'/delete-comment':(120,3600),'/listening-note':(10,3600),'/admin/remove-user':(10,3600),'/admin/restore-user':(10,3600),'/group':(30,3600),'/group-action':(120,3600),'/group-post':(30,3600),'/event':(30,3600),'/event-rsvp':(120,3600),'/event-invite':(60,3600),'/poll':(30,3600),'/poll-vote':(120,3600),'/report':(20,3600),'/admin/report-action':(60,3600),'/notification-prefs':(30,3600),'/notifications/read-all':(60,3600),'/account/delete':(5,3600)}
         if path in write_limits:
             limit,window=write_limits[path]
             if not rate_limit('write:'+path,'%s:%s'%(user['id'],client_fp),limit,window):return self.html(shell('Slow down','<section class="card">Too many requests. Try again shortly.</section>',user),429)
@@ -1397,7 +1838,8 @@ class Handler(BaseHTTPRequestHandler):
                 # (or an identical comment) within 60 seconds is rejected.
                 if body and c.execute('SELECT 1 FROM posts WHERE user_id=? AND body=? AND created>?',(user['id'],body,time.time()-60)).fetchone():
                     return self.html(shell('Post','You just posted the same thing. Wait a minute before posting it again.',user),429)
-                c.execute('INSERT INTO posts(user_id,body,created,media_key,media_type,music_track,spotify_url,spotify_track_id) VALUES(?,?,?,?,?,?,?,?)',(user['id'],body,time.time(),up[0] if up else None,up[1] if up else None,track or None,post_spotify_url,post_spotify_id))
+                cur=c.execute('INSERT INTO posts(user_id,body,created,media_key,media_type,music_track,spotify_url,spotify_track_id) VALUES(?,?,?,?,?,?,?,?)',(user['id'],body,time.time(),up[0] if up else None,up[1] if up else None,track or None,post_spotify_url,post_spotify_id))
+                store_hashtags(c,cur.lastrowid,body)
             return self.go('/')
         if path=='/delete':
             try:pid=int(data.get('post_id',''))
@@ -1426,14 +1868,26 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:return self.go('/')
             body=data.get('body','').strip()
             if not body or len(body)>1000:return self.html(shell('Comment','Comments must be 1–1,000 characters.',user),400)
+            parent_id=None
+            if data.get('parent_id'):
+                try:parent_id=int(data.get('parent_id'))
+                except ValueError:parent_id=None
             with connect() as c:
                 post=c.execute('SELECT user_id FROM posts WHERE id=?',(pid,)).fetchone()
                 if not post:return self.html(shell('Comment','Post not found.',user),404)
                 if not can_view_post(c,user['id'],post['user_id']):return self.html(shell('Comment','This post is private or unavailable.',user),403)
+                if parent_id:
+                    parent=c.execute('SELECT * FROM comments WHERE id=? AND post_id=?',(parent_id,pid)).fetchone()
+                    if not parent:return self.html(shell('Comment','Reply target not found.',user),404)
+                    if parent['parent_id'] is not None:
+                        return self.html(shell('Comment','Replies are only one level deep — reply to the top-level comment instead.',user),400)
                 if c.execute('SELECT 1 FROM comments WHERE post_id=? AND user_id=? AND body=? AND created>?',(pid,user['id'],body,time.time()-60)).fetchone():
                     return self.html(shell('Comment','You just posted the same comment. Wait a minute before posting it again.',user),429)
-                c.execute('INSERT INTO comments(post_id,user_id,body,created) VALUES(?,?,?,?)',(pid,user['id'],body,time.time()))
+                cur=c.execute('INSERT INTO comments(post_id,user_id,body,created,parent_id) VALUES(?,?,?,?,?)',(pid,user['id'],body,time.time(),parent_id))
                 if post['user_id']!=user['id']:notification(c,post['user_id'],user['id'],'comment','commented on your post',str(pid))
+                if parent_id:
+                    prow=c.execute('SELECT user_id FROM comments WHERE id=?',(parent_id,)).fetchone()
+                    if prow and prow['user_id']!=user['id'] and prow['user_id']!=post['user_id']:notification(c,prow['user_id'],user['id'],'comment','replied to your comment',str(pid))
             return self.go('/post/%s'%pid)
         if path=='/delete-comment':
             try:cid=int(data.get('comment_id',''))
@@ -1500,6 +1954,290 @@ class Handler(BaseHTTPRequestHandler):
                 if not are_friends(c,user['id'],target):return self.html(shell('Message','You can message accepted friends only.',user),403)
                 mid=uuid.uuid4().hex;c.execute('INSERT INTO messages(id,sender_id,recipient_id,body,created) VALUES(?,?,?,?,?)',(mid,user['id'],target,body,time.time()));notification(c,target,user['id'],'message','sent you a message',mid)
             return self.go('/messages?with=%s'%target)
+        if path=='/react':
+            try:pid=int(data.get('post_id',''))
+            except ValueError:return self.go('/')
+            kind=data.get('kind','')
+            if kind not in REACTION_KINDS:return self.go('/')
+            with connect() as c:
+                p=c.execute('SELECT user_id FROM posts WHERE id=?',(pid,)).fetchone()
+                if not p:return self.go('/')
+                if not can_view_post(c,user['id'],p['user_id']):return self.html(shell('Reaction','This post is private or unavailable.',user),403)
+                if kind=='nod':
+                    # Nod stays on the legacy likes table (backward compatible).
+                    row=c.execute('SELECT 1 FROM likes WHERE post_id=? AND user_id=?',(pid,user['id'])).fetchone()
+                    if row:c.execute('DELETE FROM likes WHERE post_id=? AND user_id=?',(pid,user['id']))
+                    else:
+                        c.execute('INSERT OR IGNORE INTO likes(post_id,user_id,created) VALUES(?,?,?)',(pid,user['id'],time.time()))
+                        if p['user_id']!=user['id']:notification(c,p['user_id'],user['id'],'like','liked your post',str(pid))
+                    c.execute('DELETE FROM reactions WHERE post_id=? AND user_id=?',(pid,user['id']))
+                else:
+                    existing=c.execute('SELECT kind FROM reactions WHERE post_id=? AND user_id=?',(pid,user['id'])).fetchone()
+                    c.execute('DELETE FROM likes WHERE post_id=? AND user_id=?',(pid,user['id']))
+                    if existing and existing['kind']==kind:
+                        c.execute('DELETE FROM reactions WHERE post_id=? AND user_id=?',(pid,user['id']))
+                    else:
+                        c.execute('INSERT INTO reactions(post_id,user_id,kind,created) VALUES(?,?,?,?) ON CONFLICT(post_id,user_id) DO UPDATE SET kind=excluded.kind,created=excluded.created',(pid,user['id'],kind,time.time()))
+                        if p['user_id']!=user['id']:notification(c,p['user_id'],user['id'],'reaction','reacted %s to your post'%REACTION_LABELS[kind],str(pid))
+            return self.go('/')
+        if path=='/comment-react':
+            try:cid=int(data.get('comment_id',''))
+            except ValueError:return self.go('/')
+            kind=data.get('kind','')
+            if kind not in REACTION_KINDS:return self.go('/')
+            with connect() as c:
+                cm=c.execute('SELECT cm.*,p.user_id AS post_owner FROM comments cm JOIN posts p ON p.id=cm.post_id WHERE cm.id=?',(cid,)).fetchone()
+                if not cm:return self.go('/')
+                if not can_view_post(c,user['id'],cm['post_owner']):return self.html(shell('Reaction','This post is private or unavailable.',user),403)
+                existing=c.execute('SELECT kind FROM comment_reactions WHERE comment_id=? AND user_id=?',(cid,user['id'])).fetchone()
+                if existing and existing['kind']==kind:
+                    c.execute('DELETE FROM comment_reactions WHERE comment_id=? AND user_id=?',(cid,user['id']))
+                else:
+                    c.execute('INSERT INTO comment_reactions(comment_id,user_id,kind,created) VALUES(?,?,?,?) ON CONFLICT(comment_id,user_id) DO UPDATE SET kind=excluded.kind,created=excluded.created',(cid,user['id'],kind,time.time()))
+                    if cm['user_id']!=user['id']:notification(c,cm['user_id'],user['id'],'reaction','reacted %s to your comment'%REACTION_LABELS[kind],str(cm['post_id']))
+            return self.go('/post/%s'%cm['post_id'])
+        if path=='/edit-comment':
+            try:cid=int(data.get('comment_id',''))
+            except ValueError:return self.go('/')
+            body=data.get('body','').strip()
+            if not body or len(body)>1000:return self.html(shell('Comment','Comments must be 1–1,000 characters.',user),400)
+            with connect() as c:
+                cm=c.execute('SELECT * FROM comments WHERE id=?',(cid,)).fetchone()
+                if not cm:return self.go('/')
+                if cm['user_id']!=user['id']:return self.html(shell('Comment','You can edit only your own comments.',user),403)
+                c.execute('UPDATE comments SET body=? WHERE id=?',(body,cid))
+                audit_event(c,user['id'],'edit_comment','comment',cid,{'body':body[:200]})
+            return self.go('/post/%s'%cm['post_id'])
+        if path=='/repost':
+            try:pid=int(data.get('post_id',''))
+            except ValueError:return self.go('/')
+            comment=data.get('comment','').strip()[:500]
+            with connect() as c:
+                orig=c.execute('SELECT * FROM posts WHERE id=?',(pid,)).fetchone()
+                if not orig:return self.html(shell('Repost','Post not found.',user),404)
+                if orig['is_hidden']:return self.html(shell('Repost','That post is hidden and cannot be reposted.',user),403)
+                # Privacy inheritance: a private post must NOT become public
+                # by being reposted — the viewer must be able to see the
+                # original, and the repost is only shown to people who can
+                # see the original (enforced again at render time).
+                if not can_view_post(c,user['id'],orig['user_id']):return self.html(shell('Repost','This post is private or unavailable.',user),403)
+                if orig['group_id']:return self.html(shell('Repost','Group posts cannot be reposted to the main feed.',user),400)
+                cur=c.execute('INSERT INTO posts(user_id,body,created,original_post_id) VALUES(?,?,?,?)',(user['id'],comment,time.time(),pid))
+                store_hashtags(c,cur.lastrowid,comment)
+                if orig['user_id']!=user['id']:notification(c,orig['user_id'],user['id'],'repost','reposted your post',str(pid))
+            return self.go('/')
+        if path=='/save':
+            try:pid=int(data.get('post_id',''))
+            except ValueError:return self.go('/')
+            with connect() as c:
+                p=c.execute('SELECT user_id FROM posts WHERE id=?',(pid,)).fetchone()
+                if not p:return self.go('/')
+                if not can_view_post(c,user['id'],p['user_id']):return self.html(shell('Save','This post is private or unavailable.',user),403)
+                if c.execute('SELECT 1 FROM saved_posts WHERE user_id=? AND post_id=?',(user['id'],pid)).fetchone():
+                    c.execute('DELETE FROM saved_posts WHERE user_id=? AND post_id=?',(user['id'],pid))
+                else:
+                    c.execute('INSERT OR IGNORE INTO saved_posts(user_id,post_id,created) VALUES(?,?,?)',(user['id'],pid,time.time()))
+            return self.go('/')
+        if path=='/pin':
+            try:pid=int(data.get('post_id',''))
+            except ValueError:return self.go('/')
+            with connect() as c:
+                p=c.execute('SELECT * FROM posts WHERE id=?',(pid,)).fetchone()
+                if not p:return self.go('/')
+                if p['user_id']!=user['id']:return self.html(shell('Pin','You can pin only your own posts.',user),403)
+                c.execute('UPDATE posts SET is_pinned=? WHERE id=?',(0 if p['is_pinned'] else 1,pid))
+            return self.go('/member/%s'%user['id'])
+        if path=='/poll':
+            try:pid=int(data.get('post_id',''))
+            except ValueError:return self.go('/')
+            question=data.get('question','').strip()
+            options=[o.strip() for o in data.get('options','').replace('\r','\n').split('\n') if o.strip()]
+            if not question or len(question)>200 or not (2<=len(options)<=5) or any(len(o)>120 for o in options):
+                return self.html(shell('Poll','A poll needs a question (up to 200 characters) and 2–5 options (up to 120 characters each).',user),400)
+            with connect() as c:
+                p=c.execute('SELECT user_id FROM posts WHERE id=?',(pid,)).fetchone()
+                if not p:return self.html(shell('Poll','Post not found.',user),404)
+                if p['user_id']!=user['id']:return self.html(shell('Poll','Only the post author can add a poll.',user),403)
+                if c.execute('SELECT 1 FROM polls WHERE post_id=?',(pid,)).fetchone():return self.html(shell('Poll','This post already has a poll.',user),400)
+                cur=c.execute('INSERT INTO polls(post_id,user_id,question,created) VALUES(?,?,?,?)',(pid,user['id'],question,time.time()))
+                for o in options:c.execute('INSERT INTO poll_options(poll_id,text) VALUES(?,?)',(cur.lastrowid,o))
+            return self.go('/post/%s'%pid)
+        if path=='/poll-vote':
+            try:poll_id=int(data.get('poll_id',''));opt_id=int(data.get('option_id',''))
+            except ValueError:return self.go('/')
+            with connect() as c:
+                poll=c.execute('SELECT * FROM polls WHERE id=?',(poll_id,)).fetchone()
+                if not poll:return self.go('/')
+                opt=c.execute('SELECT * FROM poll_options WHERE id=? AND poll_id=?',(opt_id,poll_id)).fetchone()
+                if not opt:return self.html(shell('Poll','That poll option does not exist.',user),400)
+                post=c.execute('SELECT user_id FROM posts WHERE id=?',(poll['post_id'],)).fetchone()
+                if post and not can_view_post(c,user['id'],post['user_id']):return self.html(shell('Poll','This post is private or unavailable.',user),403)
+                c.execute('INSERT INTO poll_votes(poll_id,user_id,option_id,created) VALUES(?,?,?,?) ON CONFLICT(poll_id,user_id) DO UPDATE SET option_id=excluded.option_id,created=excluded.created',(poll_id,user['id'],opt_id,time.time()))
+            return self.go('/post/%s'%poll['post_id'])
+        if path=='/group':
+            name=data.get('name','').strip();desc=data.get('description','').strip();vis=data.get('visibility','public')
+            if not name or len(name)>80 or len(desc)>500 or vis not in ('public','private'):
+                return self.html(shell('Group','Group name 1–80 characters, description up to 500, visibility public or private.',user),400)
+            with connect() as c:
+                cur=c.execute('INSERT INTO groups(name,description,visibility,owner_id,created) VALUES(?,?,?,?,?)',(name,desc,vis,user['id'],time.time()))
+                gid=cur.lastrowid
+                c.execute('INSERT INTO group_members(group_id,user_id,role,status,created) VALUES(?,?,?,\'accepted\',?)',(gid,user['id'],'owner',time.time()))
+                audit_event(c,user['id'],'create_group','group',gid,{'name':name,'visibility':vis})
+            return self.go('/group/%s'%gid)
+        if path=='/group-action':
+            try:gid=int(data.get('group_id',''))
+            except ValueError:return self.go('/groups')
+            action=data.get('action','')
+            with connect() as c:
+                g=c.execute('SELECT * FROM groups WHERE id=?',(gid,)).fetchone()
+                if not g:return self.go('/groups')
+                mem=group_role(c,gid,user['id'])
+                is_admin=g['owner_id']==user['id'] or (mem and mem['role'] in ('owner','admin') and mem['status']=='accepted')
+                if action=='join' and g['visibility']=='public' and not mem:
+                    c.execute('INSERT INTO group_members(group_id,user_id,role,status,created) VALUES(?,?,?,\'accepted\',?)',(gid,user['id'],'member',time.time()))
+                elif action=='request' and g['visibility']=='private' and not mem:
+                    c.execute('INSERT INTO group_members(group_id,user_id,role,status,created) VALUES(?,?,?,\'pending\',?)',(gid,user['id'],'member',time.time()))
+                    for adm in c.execute("SELECT user_id FROM group_members WHERE group_id=? AND role IN ('owner','admin') AND status='accepted'",(gid,)).fetchall():
+                        if adm['user_id']!=user['id']:notification(c,adm['user_id'],user['id'],'group_invite','requested to join %s'%g['name'],str(gid))
+                elif action=='leave' and mem and g['owner_id']!=user['id']:
+                    c.execute('DELETE FROM group_members WHERE group_id=? AND user_id=?',(gid,user['id']))
+                elif action in ('approve','reject') and is_admin:
+                    try:tid=int(data.get('user_id',''))
+                    except ValueError:return self.go('/group/%s'%gid)
+                    if action=='approve':
+                        c.execute("UPDATE group_members SET status='accepted' WHERE group_id=? AND user_id=? AND status='pending'",(gid,tid))
+                        notification(c,tid,user['id'],'group_invite','approved your request to join %s'%g['name'],str(gid))
+                    else:
+                        c.execute("DELETE FROM group_members WHERE group_id=? AND user_id=? AND status='pending'",(gid,tid))
+                elif action in ('promote','demote') and is_admin:
+                    try:tid=int(data.get('user_id',''))
+                    except ValueError:return self.go('/group/%s'%gid)
+                    if tid!=g['owner_id']:
+                        c.execute("UPDATE group_members SET role=? WHERE group_id=? AND user_id=?",('admin' if action=='promote' else 'member',gid,tid))
+            return self.go('/group/%s'%gid)
+        if path=='/group-post':
+            try:gid=int(data.get('group_id',''))
+            except ValueError:return self.go('/groups')
+            body=data.get('body','').strip()
+            if not body or len(body)>2000:return self.html(shell('Group post','Write something (up to 2,000 characters).',user),400)
+            with connect() as c:
+                g=can_view_group(c,gid,user['id'])
+                if not g:return self.html(shell('Group','You are not a member of this group.',user),403)
+                cur=c.execute('INSERT INTO posts(user_id,body,created,group_id) VALUES(?,?,?,?)',(user['id'],body,time.time(),gid))
+                store_hashtags(c,cur.lastrowid,body)
+            return self.go('/group/%s'%gid)
+        if path=='/event':
+            title=data.get('title','').strip();desc=data.get('description','').strip();loc=data.get('location','').strip()
+            try:starts=time.mktime(time.strptime(data.get('starts_at',''),'%Y-%m-%dT%H:%M'))
+            except ValueError:return self.html(shell('Event','Choose a valid date and time for the event.',user),400)
+            if not title or len(title)>120 or len(desc)>500 or len(loc)>120 or starts<=time.time():
+                return self.html(shell('Event','Events need a title (up to 120 characters) and a future date and time.',user),400)
+            gid=None
+            if data.get('group_id'):
+                try:gid=int(data.get('group_id'))
+                except ValueError:gid=None
+            with connect() as c:
+                if gid and not can_view_group(c,gid,user['id']):return self.html(shell('Event','You are not a member of that group.',user),403)
+                cur=c.execute('INSERT INTO events(group_id,user_id,title,description,location,starts_at,created) VALUES(?,?,?,?,?,?,?)',(gid,user['id'],title,desc,loc,starts,time.time()))
+                c.execute('INSERT INTO event_rsvps(event_id,user_id,status,created) VALUES(?,?,\'going\',?)',(cur.lastrowid,user['id'],time.time()))
+            return self.go('/events')
+        if path=='/event-rsvp':
+            try:eid=int(data.get('event_id',''))
+            except ValueError:return self.go('/events')
+            status=data.get('status','')
+            if status not in ('going','maybe','not_going'):return self.go('/events')
+            with connect() as c:
+                ev=c.execute('SELECT * FROM events WHERE id=?',(eid,)).fetchone()
+                if not ev:return self.go('/events')
+                if ev['group_id'] and not can_view_group(c,ev['group_id'],user['id']):return self.html(shell('Event','You are not a member of that group.',user),403)
+                c.execute('INSERT INTO event_rsvps(event_id,user_id,status,created) VALUES(?,?,?,?) ON CONFLICT(event_id,user_id) DO UPDATE SET status=excluded.status,created=excluded.created',(eid,user['id'],status,time.time()))
+            return self.go('/events')
+        if path=='/event-invite':
+            try:eid=int(data.get('event_id',''));fid=int(data.get('friend_id',''))
+            except ValueError:return self.go('/events')
+            with connect() as c:
+                ev=c.execute('SELECT * FROM events WHERE id=?',(eid,)).fetchone()
+                if not ev:return self.go('/events')
+                if not are_friends(c,user['id'],fid):return self.html(shell('Event','You can invite accepted friends only.',user),403)
+                notification(c,fid,user['id'],'event_invite','invited you to %s'%ev['title'],str(eid))
+            return self.go('/events')
+        if path=='/report':
+            target_type=data.get('target_type','');target_id=data.get('target_id','').strip();reason=data.get('reason','').strip();details=data.get('details','').strip()
+            if target_type not in ('post','comment','user','message') or not target_id or not reason or len(reason)>80 or len(details)>500:
+                return self.html(shell('Report','Choose what you are reporting and a reason (up to 80 characters).',user),400)
+            with connect() as c:
+                exists=False
+                if target_type=='post':exists=bool(c.execute('SELECT 1 FROM posts WHERE id=?',(target_id,)).fetchone()) if target_id.isdigit() else False
+                elif target_type=='comment':exists=bool(c.execute('SELECT 1 FROM comments WHERE id=?',(target_id,)).fetchone()) if target_id.isdigit() else False
+                elif target_type=='user':exists=bool(user_by_id(c,int(target_id))) if target_id.isdigit() else False
+                elif target_type=='message':exists=bool(c.execute('SELECT 1 FROM messages WHERE id=?',(target_id,)).fetchone())
+                if not exists:return self.html(shell('Report','That post, comment, user or message does not exist.',user),404)
+                if c.execute('SELECT 1 FROM reports WHERE reporter_id=? AND target_type=? AND target_id=? AND status=\'open\'',(user['id'],target_type,target_id)).fetchone():
+                    return self.html(shell('Report','You have already reported this. An admin will review it.',user),400)
+                c.execute('INSERT INTO reports(reporter_id,target_type,target_id,reason,details,status,created,updated) VALUES(?,?,?,?,?,\'open\',?,?)',(user['id'],target_type,target_id,reason,details,time.time(),time.time()))
+                audit_event(c,user['id'],'report','report',None,{'target_type':target_type,'target_id':target_id,'reason':reason})
+            return self.html(shell('Report','<section class="card"><h1>Report sent</h1><p>Thanks — an admin will review it. You will be notified of the outcome.</p><p><a class="btn" href="/">Back to feed</a></p></section>',user))
+        if path=='/admin/report-action':
+            if not user['is_admin']:return self.html(shell('Admin','<section class="card"><h1>Admin access only</h1></section>',user),403)
+            try:rid=int(data.get('report_id',''))
+            except ValueError:return self.go('/admin/moderation')
+            action=data.get('action','')
+            if action not in ('hide','remove','warn','dismiss'):return self.go('/admin/moderation')
+            with connect() as c:
+                rep=c.execute('SELECT * FROM reports WHERE id=?',(rid,)).fetchone()
+                if not rep or rep['status']!='open':return self.go('/admin/moderation')
+                target_owner=None
+                if rep['target_type']=='post' and rep['target_id'].isdigit():
+                    row=c.execute('SELECT user_id FROM posts WHERE id=?',(int(rep['target_id']),)).fetchone()
+                    target_owner=row['user_id'] if row else None
+                    if action=='hide' and row:c.execute('UPDATE posts SET is_hidden=1 WHERE id=?',(int(rep['target_id']),))
+                    if action=='remove' and row:c.execute('DELETE FROM posts WHERE id=?',(int(rep['target_id']),))
+                elif rep['target_type']=='comment' and rep['target_id'].isdigit():
+                    row=c.execute('SELECT user_id FROM comments WHERE id=?',(int(rep['target_id']),)).fetchone()
+                    target_owner=row['user_id'] if row else None
+                    if action in ('hide','remove') and row:c.execute('DELETE FROM comments WHERE id=?',(int(rep['target_id']),))
+                elif rep['target_type']=='user' and rep['target_id'].isdigit():
+                    target_owner=int(rep['target_id'])
+                elif rep['target_type']=='message':
+                    row=c.execute('SELECT sender_id FROM messages WHERE id=?',(rep['target_id'],)).fetchone()
+                    target_owner=row['sender_id'] if row else None
+                    if action in ('hide','remove') and row:c.execute('DELETE FROM messages WHERE id=?',(rep['target_id'],))
+                if action=='warn' and target_owner and target_owner!=user['id']:
+                    notification(c,target_owner,user['id'],'report_update','An admin reviewed a report about your content and issued a warning.',str(rid))
+                c.execute("UPDATE reports SET status='actioned',updated=? WHERE id=?",(time.time(),rid))
+                if target_owner:notification(c,rep['reporter_id'],user['id'],'report_update','Your report #%s was reviewed: %s.'%(rid,action),str(rid))
+                audit_event(c,user['id'],'moderate_report','report',rid,{'action':action,'target_type':rep['target_type'],'target_id':rep['target_id']})
+            return self.go('/admin/moderation')
+        if path=='/notification-prefs':
+            with connect() as c:
+                for kind in NOTIF_KINDS:
+                    enabled=1 if data.get('pref_'+kind)=='on' else 0
+                    c.execute('INSERT INTO notification_prefs(user_id,kind,enabled) VALUES(?,?,?) ON CONFLICT(user_id,kind) DO UPDATE SET enabled=excluded.enabled',(user['id'],kind,enabled))
+            return self.go('/settings')
+        if path=='/notifications/read-all':
+            with connect() as c:c.execute('UPDATE notifications SET read_at=? WHERE user_id=? AND read_at IS NULL',(time.time(),user['id']))
+            return self.go('/notifications')
+        if path=='/account/delete':
+            if user['is_admin']:return self.html(shell('Delete account','Admin accounts cannot be deleted here.',user),403)
+            confirm_email=normalize_email(data.get('confirm_email',''))
+            pwd=data.get('password','')
+            if confirm_email!=user['email'].lower() or not check_password(pwd,user['password_hash']):
+                return self.html(shell('Delete account','To delete your account, type your exact email address and enter your current password.',user),400)
+            backup_path=backup_database()
+            with connect() as c:
+                target=user['id']
+                def rows(table,where,args):
+                    return [dict(r) for r in c.execute('SELECT * FROM %s WHERE %s'%(table,where),args).fetchall()]
+                saved={'user':dict(user_by_id(c,target)),'settings':rows('user_settings','user_id=?',(target,)),'posts':rows('posts','user_id=?',(target,)),'comments':rows('comments','user_id=?',(target,)),'likes':rows('likes','user_id=?',(target,)),'reactions':rows('reactions','user_id=?',(target,)),'friendships':rows('friendships','requester_id=? OR addressee_id=?',(target,target)),'messages':rows('messages','sender_id=? OR recipient_id=?',(target,target)),'notifications':rows('notifications','user_id=? OR actor_id=?',(target,target)),'uploads':rows('uploads','user_id=?',(target,)),'blocks':rows('blocks','blocker_id=? OR blocked_id=?',(target,target)),'saved_posts':rows('saved_posts','user_id=?',(target,)),'group_members':rows('group_members','user_id=?',(target,)),'poll_votes':rows('poll_votes','user_id=?',(target,))}
+                keys=[r['key'] for r in c.execute('SELECT key FROM uploads WHERE user_id=?',(target,)).fetchall()]
+                now=time.time()
+                c.execute('INSERT INTO removed_users(original_user_id,name,email,password_hash,is_admin,joined,data_json,backup_file,removed_at,removed_by,restore_deadline) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(target,display(user),user['email'],user['password_hash'],0,user['joined'],json.dumps(saved,ensure_ascii=False),backup_path.name if backup_path else None,now,target,now+REMOVED_RETENTION_DAYS*86400))
+                audit_event(c,target,'self_delete','user',target,{'name':display(user),'email':user['email']})
+                c.execute('DELETE FROM users WHERE id=?',(target,))
+            for key in keys:
+                src=UPLOAD_DIR/key
+                if src.is_file():shutil.move(str(src),str(REMOVED_DIR/key))
+            return self.go('/','network_session=; HttpOnly; %sSameSite=Lax; Path=/; Max-Age=0; Priority=High'%self.secure_cookie())
         return self.html(shell('Not found','Page not found.',user),404)
 
 
