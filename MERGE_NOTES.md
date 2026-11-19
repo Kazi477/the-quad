@@ -1682,3 +1682,368 @@ python3 smoke_test.py
   var or secret changes. After deploy, verify: GET / 200,
   /healthz ok, register/login/post work, then let the instance
   sleep and check GET / still returns 200 after it wakes.
+
+## Update 14 — Fix live connection refused + malformed SQLite database (DEV ONLY, 2026-11-19)
+
+### What happened live (second failure, same night)
+- After the Update 13 (WAL) fix was uploaded (commit ace2f6a) and
+  redeployed, the homepage loaded once and a dummy registration
+  showed a success message — then 502s came back. The dummy
+  account creation is UNCONFIRMED: it may or may not have landed
+  before the 502s returned, so the live test must be re-run from
+  scratch after this deploy.
+- Mitchell spotted the key line in the Render logs:
+  `2026/11/19 12:14:47 [error] 10#10: *1 connect() failed (111:
+  Connection refused) while connecting to upstream, client:
+  10.238.24.253, server: _, request: "GET /healthz HTTP/1.1",
+  upstream: "http://127.0.0.1:8081/healthz", host:
+  "the-quad-free.onrender.com"`. The app logs also reported a
+  malformed SQLite database.
+
+### Root cause (proved in dev)
+- A local replica file whose header/pages are torn by an unclean
+  Render spin-down comes back as "file is not a database" /
+  "database disk image is malformed" — proved with a probe that
+  overwrote a replica header with garbage: libsql raises
+  `Error: file is not a database` on open.
+- Update 13 only treated WAL/lock errors as recoverable, so a
+  corrupt file was NOT healed: _wal_self_check swallowed
+  non-WAL errors, and connect_turso's open-failure path only
+  retried after removing sidecars.
+- Worse, main() ran init_db() + PRAGMA quick_check BEFORE
+  binding its port, so the process died before it ever listened
+  on 8081. nginx was up, nothing was listening, every request
+  (including /healthz) got connection refused, and the app could
+  not even answer with the 503 'unhealthy' its handler returns
+  when the DB is down. Render therefore saw connection refused
+  instead of a diagnosable failure.
+- start.sh also started nginx at the same moment as the app, so
+  even a normal startup could log connection-refused while the
+  app was still starting.
+
+### What changed (all in dev, backup zip md5 re-verified unchanged)
+- `db_backend.py` — 495 → 632 lines. Pre-change copy kept as
+  `db_backend.py.bak-malformed502`.
+  - 'malformed' / 'file is not a database' / 'database disk
+    image is malformed' (and friends) are now recoverable
+    corruption, treated like the WAL errors everywhere
+    (_is_corrupt_error, _is_wal_error now covers both).
+  - _wal_self_check now also runs PRAGMA quick_check: a
+    non-'ok' result raises as corruption and triggers recovery.
+    A checkpoint alone can pass on a torn file, so this is what
+    catches the malformed case the WAL fix missed.
+  - New _quarantine_local_file(): a damaged replica is moved
+    aside as `<file>.corrupt-<timestamp>` instead of deleted —
+    forensic evidence, and free on the ephemeral /tmp disk.
+  - New _rebuild_replica() / public rebuild_replica(): quarantine
+    + fresh open from Turso (only with a real libsql:// URL).
+    The local file is NEVER deleted or rebuilt when there is no
+    cloud copy (local/dev safety, unchanged).
+  - connect_turso's open-failure path now rebuilds from Turso
+    when the second open still fails with a corruption error;
+    _apply_pragmas failures get the same recovery; the probe's
+    final rebuild step now quarantines instead of unlinking.
+- `the_network_production.py` — 2683 → 2760 lines. Pre-change
+  copy kept as `the_network_production.py.bak-malformed502`.
+  - New ensure_database_healthy(): runs init_db() + quick_check;
+    on failure with a real libsql:// URL it rebuilds the replica
+    from Turso once and re-checks; otherwise it prints FATAL and
+    raises RuntimeError with a clear message (a bare sqlite
+    error was re-raised before this was caught by the new tests).
+  - main() now binds the listening socket FIRST, then runs the
+    DB gate, then serves. A rebuild can happen while the socket
+    is already bound; an unrecoverable DB still exits loudly
+    (FATAL, Render restarts) instead of leaving nginx proxying
+    to a dead process. /healthz already returns 503 'unhealthy'
+    when the app is up but the DB is down — that path now works
+    because the app is actually listening.
+- `start.sh` — now waits (up to 60s) for the app to answer
+  /healthz 200 before starting nginx; if the app exits while
+  waiting it exits too so Render restarts the container instead
+  of serving 502s. Pre-change copy kept as
+  `start.sh.bak-malformed502`.
+- New `malformed502_test.py` — 25 checks (see Tests below).
+- No branding, features, routes, auth or behaviour changed when
+  the DB is healthy. No payment, no credentials invented.
+
+### Tests (dev only, temp DBs wiped after each run)
+- `python3 malformed502_test.py` — **25 passed, 0 failed**:
+  corruption markers; corrupt replica in local mode raises
+  loudly and the file is untouched; corrupt replica with a
+  simulated Turso cloud rebuilds with the cloud data present
+  and the damaged file quarantined; quick_check != ok raises
+  as corruption; ensure_database_healthy rebuilds (mocked
+  Turso) and the schema exists afterwards, and raises
+  RuntimeError without a cloud copy; a subprocess on a corrupt
+  plain-SQLite DATA_DIR exits non-zero, logs FATAL and never
+  serves /healthz; a subprocess on a healthy DB binds and
+  serves /healthz 200 + homepage 200; start.sh waits for
+  /healthz before nginx. The suite caught one real bug while
+  being written (ensure_database_healthy re-raised a bare
+  sqlite error instead of RuntimeError) and one test-design
+  bug (a fresh 4 KB schema-only file is treated by plain
+  sqlite as an empty DB, so the gate test grows the DB past
+  one page first; WAL-mode rows also live in -wal until a
+  checkpoint, which the test now does).
+- All suites re-run after the fix: smoke **PASS**, merge **51**,
+  auth **25**, security **84**, fix **32**, listening **44**,
+  top5 **78**, forgot **29**, failover **31**, pythonanywhere
+  **12**, render_free **30**, object_storage **68**, wal502 **20**,
+  malformed502 **25** — **529 checks + smoke PASS, 0 failed**.
+- `python3 -W error -m py_compile` OK for all changed files;
+  `bash -n start.sh` OK.
+
+### Remaining risks (honest)
+- A real Turso cloud sync + a real Render spin-down still cannot
+  be tested in dev; the first live restart after deploy is the
+  true proof. The fix now heals corruption in three layers
+  (open-time rebuild, probe quick_check + rebuild, startup gate
+  rebuild) AND binds the port before the DB gate, so a torn
+  replica should recover on the next start instead of
+  crash-looping — but watch the first restart's logs for
+  "Turso replica damaged; quarantined" / "rebuilt from Turso" /
+  "FATAL" lines.
+- If a rebuild from Turso is ever needed, writes that only lived
+  in the local WAL/file and never reached the cloud are lost —
+  inherent to the embedded-replica design; rebuild is a last
+  resort. Live has no confirmed real accounts/posts yet (the
+  dummy account from the failed night is unconfirmed), so a
+  rebuild on first deploy loses nothing confirmed.
+- What actually tore the replica file is not proven: the most
+  likely causes are the unclean kill on spin-down and/or
+  concurrent per-request libSQL connections (one per request
+  thread, each with a 60s background sync) racing on the same
+  local file. The recovery now absorbs the damage, but the
+  underlying contention is unchanged; if malformed replicas
+  keep recurring, the next step is a single-writer/connection
+  design, not another recovery layer.
+- While the DB is unusable, /healthz returns 503 'unhealthy'
+  (correct — Render's health check should see it), and real
+  writes (posts, logins, registrations) still fail loudly
+  until the startup rebuild heals the replica.
+
+### To deploy after Mitchell approves
+- A Render restart/redeploy IS needed: the fix is code, not a
+  setting. Redeploy from GitHub after uploading (commit ace2f6a
+  is what is live now; this fix is not on GitHub yet). No env
+  var or secret changes. After deploy, verify: GET / 200,
+  /healthz ok, then RE-RUN the full dummy-account live test
+  from scratch (create 'Sydney Test', post, log out/in, delete
+  it, confirm it cannot log in again) — the previous dummy
+  account is unconfirmed — then let the instance sleep and
+  check GET / still returns 200 after it wakes.
+
+## Update 15 — Fix-all pass: every broken code path, incl. a broken password reset (DEV ONLY, 2026-11-19)
+
+Mitchell: "Fix all broken code and issues, take your time, I want it
+perfect." Dev only, NOT deployed, NOT on GitHub. This pass builds on
+Update 14 (which was still being finished when this pass started, so
+the audit ran read-only first and edits began once Update 14's files
+went quiet). Pre-change copies kept as `.bak-fixall15` for
+`the_network_production.py`, `db_backend.py`, `start.sh` and
+`nginx.conf.template`. Backup zip md5 re-verified unchanged at start
+and end: `aae87ec977f13b371de50aedb192cd96`.
+
+### Issues found, with root cause in plain terms
+
+1. **Recovery-code password reset was broken since Update 7 —
+   and nobody knew, because the test was lying.** In
+   `the_network_production.py`, the recovery-code branch of
+   `POST /reset-password` ran this SQL:
+   `UPDATE users SET password_hash=?,must_change_password=<redacted>
+   WHERE id=?` — the literal text `<redacted>` in the SQL, which
+   SQLite rejects with `OperationalError near "<": syntax error`.
+   Every password reset using a recovery code failed. That matters
+   more than it sounds: emailed reset codes cannot send (no SMTP),
+   so recovery codes are the ONLY working password-reset path, and
+   they have never worked over HTTP. Why it was never caught: the
+   pre-Update-15 server had no top-level error guard, so the
+   exception killed the request with no response at all; the test
+   client then crashed partway through the suite, and the test's
+   `finally` block printed the checks run so far ("29 passed,
+   0 failed") and exited 0, swallowing the crash. The suite was
+   reporting a pass for checks that never ran. Fixed: the SQL now
+   reads `must_change_password=0`, matching the email-code branch.
+   The other two places that looked the same in a text view
+   (email-code reset, login rehash) were verified by executing
+   their SQL against a throwaway database — both are valid; the
+   `<redacted>` there is only a display artefact of the value
+   `0` / `?`.
+2. **WAL / malformed DB — Update 14's recovery had gaps.**
+   `connect_turso`'s open-failure path only rebuilt from Turso on a
+   corruption error, not on a WAL failure on the second open; a
+   failed `_apply_pragmas` did not re-check whether another thread
+   had already healed the replica; and two threads could run a
+   rebuild at the same time. Also, `rate_limit()` only treated
+   WAL/lock errors as transient, so a malformed replica still made
+   every rate-limited POST fail instead of falling back.
+3. **Connection refused on startup — Update 14's start.sh had a
+   hole.** Its wait loop fell through and started nginx even when
+   the app NEVER became healthy within 120 attempts, so Render
+   could serve 502s indefinitely instead of restarting the
+   container. The app also did its (sometimes slow) startup
+   database backup synchronously before serving, delaying the
+   first listen, and nginx waited up to its 60 s default to
+   connect to an app that was not there yet.
+4. **BrokenPipeError tracebacks.** When a visitor's browser or
+   phone closed a connection mid-send (common on a free instance
+   that sleeps), `do_GET`/`html`/`send_response` raised
+   `BrokenPipeError` and printed a full traceback, and the
+   dropped connection could look like a 502 to nginx. The first
+   attempt at this fix put a `handle_error` override on the
+   request `Handler` — but `BaseHTTPRequestHandler` has no
+   `handle_error` at all; socketserver calls the *server's*
+   `handle_error`. That was caught by the new test suite and moved
+   to `NetworkHTTPServer.handle_error()`.
+5. **Any handler crash killed the request with no response.**
+   Before this pass an unhandled exception in `do_GET`/`do_POST`
+   escaped with no response (nginx 502, visitor could not tell
+   whether their post/account had landed). The first version of
+   the guard also left `/healthz` inside the guarded handler, so
+   a crashing handler took the health check down too.
+6. **Bookkeeping writes could still kill a page.** `session()`
+   died outright if `connect()` raised, and `shell()` ran badge
+   count queries with no guard, so a DB outage turned every page
+   into an error instead of a signed-out page with zero badges.
+
+### What changed
+
+- `the_network_production.py` 2760 → **2882 lines**:
+  - `Handler._write()` swallows `BrokenPipeError` /
+    `ConnectionResetError` (returns False when the client is
+    gone); `Handler.html()` and every other `self.wfile.write`
+    call site use it. (One self-inflicted bug caught immediately:
+    the sed also rewrote the write *inside* `_write` itself to
+    `self._write(data)` — infinite recursion — fixed back to
+    `self.wfile.write(data)`.)
+  - `NetworkHTTPServer.handle_error()` swallows
+    BrokenPipe/ConnectionReset and delegates everything else to
+    super, so a dropped client logs nothing and a real error
+    still logs a traceback.
+  - `Handler._safe_error()` — a static 500 page that touches no
+    DB/session/template (`shell()` queries the DB, so it cannot
+    be used on a DB failure).
+  - `do_GET()`/`do_POST()` now wrap renamed `_do_GET()` /
+    `_do_POST()` in try/except: BrokenPipe/ConnectionReset pass
+    silently, other exceptions log one line (`do_GET failed:` /
+    `do_POST failed:`) and render `_safe_error(500)` instead of
+    dropping the connection.
+  - `/healthz` extracted into `Handler._healthz()` and called
+    from `do_GET()` *before* `_do_GET()`, so the health check
+    works even if a page handler is broken.
+  - `Handler.session()` catches any `connect()` exception and
+    degrades to signed-out `(None, None)` with a log line.
+  - `shell()` badge counts wrapped in try/except, defaulting to
+    0,0,0 when the DB is down.
+  - `_rate_limit_is_transient()` now also treats 'malformed' /
+    'file is not a database' / 'database disk image is
+    malformed' as transient.
+  - `main()` startup database backup now runs in a background
+    daemon thread instead of synchronously before `serve_forever`
+    (shutdown backup in `finally` unchanged).
+  - Recovery-code reset SQL fixed: `must_change_password=0`
+    (see issue 1).
+- `db_backend.py` 632 → **671 lines**: new `_RECOVERY_LOCK`
+  serialising rebuilds; `connect_turso` open-failure path now
+  rebuilds from Turso on a WAL failure on the second open too
+  (previously only corruption); `_apply_pragmas` failure recovery
+  now runs under the lock and tries a fresh open first inside
+  the lock (another thread may already have healed the replica)
+  before rebuilding; `_wal_probe_or_recover`'s open-after-sidecar-
+  removal failure now rebuilds from Turso when a cloud copy
+  exists instead of giving up.
+- `start.sh` (66 lines): the wait loop now tracks a `healthy`
+  flag and exits 1 (killing the app process first) with "FATAL:
+  app did not become healthy within 60s; not starting nginx."
+  if the app never answers /healthz 200, so Render restarts the
+  container instead of serving 502s indefinitely.
+- `nginx.conf.template` (61 lines): added
+  `proxy_connect_timeout 5s;` in both the /healthz location and
+  the main location (was nginx's 60 s default), so a request
+  during a restart fails fast and can be retried.
+- New `fixall_test.py` (428 lines, **23 checks**): rate_limit
+  malformed fallback + limit still enforced; session() degrading
+  to signed-out when connect() raises; shell() rendering with
+  zero badges when DB is down; a crashing handler returning a
+  real 500 page ("Something went wrong") while /healthz stays
+  200 and the homepage recovers to 200 afterwards; `_write()`
+  swallowing BrokenPipe/ConnectionReset; server handle_error
+  logging no traceback for BrokenPipe but still logging a
+  traceback for a real error; db_backend rebuilding from Turso
+  after a WAL failure on re-open (simulated with a fake
+  _open_raw, seeded cloud data present, damaged file
+  quarantined) and `_RECOVERY_LOCK` existing; start.sh exiting
+  when the app never becomes healthy and nginx starting only
+  after the health check; nginx proxy_connect_timeout 5s;
+  main() startup backup in a background thread.
+- `forgot_test.py` hardened (326 lines): the `finally` block now
+  exits 1 if an exception is in flight (a crashed run can no
+  longer report "29 passed, 0 failed"), and the captured server
+  log tail printed at the end is 9000 chars instead of 1500, so
+  a traceback is no longer cut off before it can be read.
+
+### Test results (all suites, dev only, re-run after the fix)
+
+- smoke **PASS**, merge **51**, auth **25**, security **84**,
+  fix **32**, listening **44**, top5 **78**, forgot **45**,
+  failover **31**, pythonanywhere **12**, render_free **30**,
+  object_storage **68**, wal502 **20**, malformed502 **25**,
+  fixall **23** — **568 checks + smoke PASS, 0 failed**.
+- About the forgot count: 29 was the false pass from the crash
+  (checks after the crash never ran); 39 was the honest partial
+  count while the broken SQL was still in place (31 passed,
+  8 failed, all 8 recovery-code related); 45 is the true total
+  now that the suite runs to completion. The direct in-process
+  recovery-code branch (user → generate codes → consume →
+  update password → audit) was also verified separately and
+  works; the failure was only ever the one broken SQL line in
+  the HTTP path.
+- `py_compile` OK for all changed Python files;
+  `bash -n start.sh` OK. No branding, features, routes, or auth
+  behaviour changed when the database is healthy.
+
+### Remaining risks (honest)
+
+- Real Turso cloud sync + a real Render spin-down still cannot
+  be tested in dev; the first live restart after deploy is the
+  true proof — watch the first restart's logs for "Turso replica
+  damaged; quarantined" / "rebuilt from Turso" / "FATAL" lines,
+  and for any new "do_GET failed:" / "do_POST failed:" lines.
+- While the DB is unusable, rate limiting is per-process memory
+  only (resets on restart) and traffic counts under-count; real
+  writes (posts, logins, registrations) still fail loudly until
+  the startup rebuild heals the replica — now as a readable 500
+  page instead of a dropped connection.
+- If a rebuild from Turso is ever needed, writes that only lived
+  in the local WAL/file and never reached the cloud are lost —
+  inherent to the embedded-replica design; rebuild is a last
+  resort. Live has no confirmed real accounts/posts yet (the
+  dummy account from launch night is unconfirmed), so a rebuild
+  on first deploy loses nothing confirmed.
+- What actually tears the replica file is not proven (most likely
+  the unclean kill on spin-down and/or concurrent per-request
+  libSQL connections racing on the same local file). The recovery
+  now absorbs the damage, but the underlying contention is
+  unchanged; if malformed replicas keep recurring, the next step
+  is a single-writer/connection design, not another recovery
+  layer.
+- The recovery-code reset bug means password reset via recovery
+  code has never worked on live (it was never deployed in a
+  working state, and the live site is on commit ace2f6a, which
+  predates neither the bug nor the fix — the bug is in ace2f6a's
+  code too). After this deploy, test a recovery-code reset live
+  as part of the dummy-account test.
+
+### To deploy after Mitchell approves
+
+- Upload to GitHub (new staging dir, e.g. `upload8/`), then
+  redeploy the-quad-free on Render (auto-deploy on commit should
+  trigger; verify manually if it does not). No env var or secret
+  changes. After deploy, verify: GET / 200, /healthz ok, then
+  RE-RUN the full dummy-account live test from scratch (create
+  'Sydney Test', post, log out/in, delete it, confirm it cannot
+  log in again — the previous dummy account is unconfirmed), and
+  include a recovery-code reset in the test (Settings → Password
+  recovery → make codes → log out → reset with one code → log in
+  with the new password). Then let the instance sleep and check
+  GET / still returns 200 after it wakes.

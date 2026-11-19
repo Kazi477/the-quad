@@ -17,7 +17,7 @@ To send password reset emails, configure SMTP_HOST, SMTP_FROM, SMTP_PORT (587 by
 default), SMTP_USERNAME and SMTP_PASSWORD in the server environment. For implicit
 TLS on port 465, also set SMTP_USE_SSL=1. Never put mail passwords in shared code.
 """
-import hashlib, hmac, html, json, mimetypes, os, re, secrets, shutil, signal, smtplib, sqlite3, ssl, subprocess, threading, time, urllib.parse, uuid, webbrowser
+import hashlib, hmac, html, json, mimetypes, os, re, secrets, shutil, signal, smtplib, sqlite3, ssl, subprocess, sys, threading, time, urllib.parse, uuid, webbrowser
 from email.parser import BytesParser
 from email.message import EmailMessage
 from email.policy import default
@@ -208,6 +208,71 @@ def init_db():
         placeholders = ','.join('?' for _ in ADMIN_EMAILS)
         c.execute('UPDATE users SET is_admin=1, name=?, display_name=? WHERE lower(email) IN (%s)' % placeholders,
                   (OWNER_NAME, OWNER_NAME, *ADMIN_EMAILS))
+
+
+def ensure_database_healthy():
+    """Startup database gate (Update 14).
+
+    Runs init_db() and then PRAGMA quick_check. If either fails
+    or the check is not 'ok', and Turso mode is on with a real
+    libsql:// URL, the local replica is rebuilt from Turso once
+    (db_backend.rebuild_replica: damaged file quarantined, fresh
+    sync from the cloud) and the check is re-run. If there is no
+    cloud copy to rebuild from, or the rebuild still fails, this
+    raises RuntimeError with a clear FATAL message — the process
+    must NOT start serving on a damaged database, and it must
+    NOT die silently: main() prints the failure and exits so
+    Render restarts the container and the log says exactly why.
+
+    Why this exists: the live failure of 2026-11-19 (second one).
+    The replica file went 'malformed' / 'file is not a database'
+    after the WAL fix redeploy; init_db()/quick_check in main()
+    raised BEFORE the server bound its port, so the Python
+    process was already dead and nginx logged
+    'connect() failed (111: Connection refused) while connecting
+    to upstream, upstream: http://127.0.0.1:8081/healthz'.
+    A dead app cannot answer /healthz at all — not even with the
+    503 'unhealthy' the handler returns when the DB is down —
+    so Render saw connection refused instead of a diagnosable
+    failure. main() now binds the port first and calls this gate
+    second, so a rebuild can happen while the socket is already
+    bound, and an unrecoverable DB still fails loudly in the log.
+    """
+    turso_url = os.environ.get('TURSO_DATABASE_URL', '').strip()
+    turso_token = os.environ.get('TURSO_AUTH_TOKEN', '').strip()
+    can_rebuild = bool(turso_url and turso_token
+                       and turso_url.startswith('libsql://'))
+    for attempt in (1, 2):
+        try:
+            init_db()
+            with connect() as c:
+                check = c.execute('PRAGMA quick_check').fetchone()[0]
+            if check == 'ok':
+                return
+            raise RuntimeError('SQLite integrity check failed: %s' % check)
+        except Exception as exc:
+            if attempt == 1 and can_rebuild:
+                print('Startup database check failed (%s); '
+                      'rebuilding the local replica from Turso...'
+                      % exc)
+                try:
+                    import db_backend
+                    rebuilt = db_backend.rebuild_replica(
+                        DB_PATH, turso_url, turso_token)
+                    rebuilt.close()
+                except Exception as rex:
+                    print('FATAL: The Campus cannot start: database '
+                          'is damaged and the rebuild from Turso '
+                          'failed: %s' % rex)
+                    raise RuntimeError(
+                        'Database is damaged and could not be rebuilt '
+                        'from Turso: %s' % rex) from rex
+                continue
+            print('FATAL: The Campus cannot start: database is '
+                  'unusable: %s' % exc)
+            raise RuntimeError(
+                'Database is unusable and could not be rebuilt: %s'
+                % exc) from exc
 
 
 def import_legacy_database():
@@ -508,7 +573,9 @@ def _rate_limit_is_transient(exc):
     msg = str(exc).lower()
     return any(m in msg for m in
                ('wal_insert_begin', 'database is locked',
-                'database is busy', 'busy', 'locked', 'wal'))
+                'database is busy', 'busy', 'locked', 'wal',
+                'malformed', 'file is not a database',
+                'not a database', 'database disk image is malformed'))
 
 
 def _rate_limit_memory(action, key_hash, limit, window_seconds, now):
@@ -657,9 +724,18 @@ CSS = '''
 
 def shell(title, content, user=None, error=''):
     if user:
-        with connect() as c:
-            counts=c.execute("SELECT (SELECT COUNT(*) FROM friendships WHERE addressee_id=? AND status='pending') friends,(SELECT COUNT(*) FROM notifications WHERE user_id=? AND read_at IS NULL) alerts,(SELECT COUNT(*) FROM messages WHERE recipient_id=? AND read_at IS NULL) messages",(user['id'],user['id'],user['id'])).fetchone()
-            friend_count,alert_count,message_count=counts['friends'],counts['alerts'],counts['messages']
+        # Update 15: the badge counts are decoration. If the
+        # database is down mid-request, every logged-in page used
+        # to die here (after session() had already succeeded),
+        # turning a recoverable DB blip into a 502 for a signed-in
+        # visitor. Default to zero badges instead.
+        try:
+            with connect() as c:
+                counts=c.execute("SELECT (SELECT COUNT(*) FROM friendships WHERE addressee_id=? AND status='pending') friends,(SELECT COUNT(*) FROM notifications WHERE user_id=? AND read_at IS NULL) alerts,(SELECT COUNT(*) FROM messages WHERE recipient_id=? AND read_at IS NULL) messages",(user['id'],user['id'],user['id'])).fetchone()
+                friend_count,alert_count,message_count=counts['friends'],counts['alerts'],counts['messages']
+        except Exception as exc:
+            print('shell badge counts failed:',type(exc).__name__,exc)
+            friend_count,alert_count,message_count=0,0,0
         items=[('/', 'Feed', 0),('/explore','Explore',0),('/groups','Groups',0),('/people','People',0),('/friends','Friends',friend_count),('/messages','Messages',message_count),('/notifications','Alerts',alert_count),('/profile','Profile',0),('/settings','Settings',0)]
         links = ''.join('<a href="%s">%s%s</a>' % (path,text,('<span class="badge">%s</span>'%count) if count else '') for path,text,count in items)
         nav = links + ('<a href="/admin">Admin</a>' if user['is_admin'] else '') + '<form class="inline" method="post" action="/logout"><input type="hidden" name="csrf" value="%s"><button class="light">Sign out</button></form>' % esc(user['csrf'])
@@ -1020,6 +1096,40 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         # Do not persist visitor IP addresses in application logs.
         print(fmt % args)
+    def _write(self, data):
+        # Update 15: one safe place to write the response body.
+        # A client that disconnects mid-send raises BrokenPipeError
+        # / ConnectionResetError; that must end this request
+        # quietly, never escape as a traceback and never 502
+        # anyone else (ThreadingHTTPServer serves each request on
+        # its own thread, but the traceback spam hid real errors
+        # in the logs). Returns False when the client is gone.
+        try:
+            self.wfile.write(data)
+            return True
+        except (BrokenPipeError, ConnectionResetError):
+            return False
+    def _safe_error(self, status=500):
+        # Update 15: last-resort error page. It touches NO
+        # database, NO session and NO template helper (shell()
+        # queries the database for badge counts, so it cannot be
+        # used here — if the DB is what broke, shell() would
+        # break again). A plain static page is always renderable.
+        body = ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+                '<title>Something went wrong · The Campus</title></head>'
+                '<body><h1>Something went wrong</h1>'
+                '<p>Please try again in a moment. If it keeps happening, '
+                'let the admin know.</p>'
+                '<p><a href="/">Back to The Campus</a></p></body></html>').encode('utf-8')
+        try:
+            self.send_response(status)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.security_headers()
+            self.end_headers()
+            self._write(body)
+        except Exception:
+            pass
     def security_headers(self, cache_control='no-store'):
         self.send_header('Cache-Control',cache_control)
         self.send_header('X-Content-Type-Options','nosniff')
@@ -1033,7 +1143,7 @@ class Handler(BaseHTTPRequestHandler):
     def html(self, text, status=200, cookie=None):
         body=text.encode('utf-8');self.send_response(status);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Content-Length',str(len(body)));self.security_headers()
         if cookie:self.send_header('Set-Cookie',cookie)
-        self.end_headers();self.wfile.write(body)
+        self.end_headers();self._write(body)
     def go(self,path='/',cookie=None):
         self.send_response(303);self.send_header('Location',path);self.security_headers()
         if cookie:self.send_header('Set-Cookie',cookie)
@@ -1062,15 +1172,27 @@ class Handler(BaseHTTPRequestHandler):
             if k=='network_session':token=v
         if not token:return None,None
         now=time.time()
-        with connect() as c:
-            row=c.execute('SELECT u.*,s.csrf FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires>? AND s.last_seen>?',(token,now,now-SESSION_IDLE_TIMEOUT)).fetchone()
-            if not row:
-                # Update 13: expiring a dead session is housekeeping.
-                # If the replica WAL is broken, a failed DELETE must
-                # not 502 the page — the visitor is simply signed out.
-                try:c.execute('DELETE FROM sessions WHERE token=?',(token,))
-                except Exception as exc:print('session cleanup failed:',type(exc).__name__,exc)
-        return row,token
+        # Update 15: session lookup is the first database touch on
+        # EVERY request (do_GET and do_POST both start here). If
+        # connect() itself raises — corrupt replica, Turso sync
+        # failure, WAL failure — the request must degrade to
+        # signed-out instead of dying with no response at all
+        # (nginx 502, as on 2026-11-19). The visitor simply sees
+        # the signed-out welcome page; a write that needs the DB
+        # will fail honestly later, with a 500 page, not a 502.
+        try:
+            with connect() as c:
+                row=c.execute('SELECT u.*,s.csrf FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires>? AND s.last_seen>?',(token,now,now-SESSION_IDLE_TIMEOUT)).fetchone()
+                if not row:
+                    # Update 13: expiring a dead session is housekeeping.
+                    # If the replica WAL is broken, a failed DELETE must
+                    # not 502 the page — the visitor is simply signed out.
+                    try:c.execute('DELETE FROM sessions WHERE token=?',(token,))
+                    except Exception as exc:print('session cleanup failed:',type(exc).__name__,exc)
+            return row,token
+        except Exception as exc:
+            print('session lookup failed:',type(exc).__name__,exc)
+            return None,None
     def read_form(self):
         try: length=int(self.headers.get('Content-Length','0'))
         except ValueError: raise ValueError('Invalid request size.')
@@ -1101,16 +1223,44 @@ class Handler(BaseHTTPRequestHandler):
             with connect() as c:c.execute('UPDATE users SET last_seen=? WHERE id=?',(now,user['id']));c.execute('UPDATE sessions SET last_seen=? WHERE token=?',(now,token))
         except Exception as exc:
             print('touch: last_seen update failed:',type(exc).__name__,exc)
+    def _healthz(self):
+        # The health check answers without rendering anything and
+        # without a session: Render (and start.sh) must be able to
+        # tell 'app up, DB down' (503) from 'app not listening at
+        # all' (connection refused). It is called from do_GET
+        # BEFORE _do_GET, so a crash in any page handler can never
+        # take the health check down with it (Update 15).
+        try:
+            with connect() as c:c.execute('SELECT 1').fetchone()
+            if not os.access(DATA_DIR,os.W_OK):raise OSError('data directory not writable')
+            body=b'ok';status=200
+        except Exception:
+            body=b'unhealthy';status=503
+        self.send_response(status);self.send_header('Content-Type','text/plain; charset=utf-8');self.send_header('Content-Length',str(len(body)));self.security_headers();self.end_headers();self._write(body)
     def do_GET(self):
+        # Update 15: top-level guard. Before this, ANY unhandled
+        # exception in a page handler (a DB error in feed(),
+        # explore(), a route nobody had exercised since a schema
+        # change, a corrupt replica mid-request) escaped do_GET,
+        # BaseHTTPRequestHandler closed the connection with no
+        # response, and nginx answered 502 — while the traceback
+        # in the log looked like the site was down. Now the
+        # visitor gets a real 500 page from the app instead, and
+        # the error is one log line, not a dropped connection.
+        try:
+            path=urllib.parse.urlparse(self.path).path
+            if path in ('/health','/healthz'):
+                return self._healthz()
+            self._do_GET()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:
+            print('do_GET failed:', type(exc).__name__, exc)
+            self._safe_error(500)
+    def _do_GET(self):
         path=urllib.parse.urlparse(self.path).path
         if path in ('/health','/healthz'):
-            try:
-                with connect() as c:c.execute('SELECT 1').fetchone()
-                if not os.access(DATA_DIR,os.W_OK):raise OSError('data directory not writable')
-                body=b'ok';status=200
-            except Exception:
-                body=b'unhealthy';status=503
-            self.send_response(status);self.send_header('Content-Type','text/plain; charset=utf-8');self.send_header('Content-Length',str(len(body)));self.security_headers();self.end_headers();self.wfile.write(body);return
+            return self._healthz()
         user,token=self.session()
         if path not in ('/app.js','/app.css','/activity.js','/favicon.ico') and not path.startswith('/media/'):
             # Count actual pages, not polling requests or media fetches. Do not collect IPs.
@@ -1140,7 +1290,7 @@ class Handler(BaseHTTPRequestHandler):
         if user and user['must_change_password'] and path not in ('/change-password','/logout','/app.js','/app.css','/activity.js','/favicon.ico','/health','/healthz'):
             return self.html(change_password_page(user, forced=True))
         if path == '/app.css':
-            body = CSS.encode('utf-8'); self.send_response(200); self.send_header('Content-Type', 'text/css; charset=utf-8'); self.send_header('Content-Length', str(len(body))); self.security_headers('private, max-age=300'); self.end_headers(); self.wfile.write(body); return
+            body = CSS.encode('utf-8'); self.send_response(200); self.send_header('Content-Type', 'text/css; charset=utf-8'); self.send_header('Content-Length', str(len(body))); self.security_headers('private, max-age=300'); self.end_headers(); self._write(body); return
         if path == '/change-password':
             if not user: return self.html(login_page('Sign in first, then change your password.'))
             return self.html(change_password_page(user, forced=bool(user['must_change_password'])))
@@ -1148,7 +1298,7 @@ class Handler(BaseHTTPRequestHandler):
             js="""(()=>{const csrf=()=>document.querySelector('[name=csrf]')?.value||'';const ping=()=>{if(document.visibilityState==='visible'&&csrf())fetch('/activity',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'csrf='+encodeURIComponent(csrf())}).catch(()=>{});};if(csrf()){ping();setInterval(ping,30000);document.addEventListener('visibilitychange',ping)}document.addEventListener('submit',e=>{const f=e.target;if(!(f instanceof HTMLFormElement))return;const msg=f.dataset.confirm;if(msg&&!confirm(msg)){e.preventDefault();return}if(f.dataset.videoForm==='1'&&!f.dataset.videoChecked){const file=f.querySelector('input[type=file][name=media]')?.files?.[0];if(file&&file.type.startsWith('video/')){e.preventDefault();const v=document.createElement('video');v.preload='metadata';v.onloadedmetadata=()=>{URL.revokeObjectURL(v.src);if(!v.duration||v.duration>30){alert('Videos must be 30 seconds or shorter.');return}const d=f.querySelector('[name=duration_ms]');if(d)d.value=Math.round(v.duration*1000);f.dataset.videoChecked='1';f.requestSubmit()};v.onerror=()=>alert('Could not read this video.');v.src=URL.createObjectURL(file);return}}if(f.dataset.lockSubmit==='1'){const b=f.querySelector('button[type=submit],button:not([type])');if(b){b.disabled=true;b.textContent=b.dataset.wait||'Working…'}}})
 (()=>{const TRACKS={'quad-dawn':{label:'Campus Radio · Dawn Loop',notes:[[523.25,.5],[587.33,.5],[659.25,.5],[783.99,1],[659.25,.5],[587.33,1]]},'quad-night':{label:'Campus Radio · Night Loop',notes:[[440,.5],[523.25,.5],[415.3,.5],[392,1],[329.63,.5],[440,1]]},'quad-quad':{label:'Campus Radio · Campus Anthem',notes:[[659.25,.25],[783.99,.25],[880,.5],[783.99,.25],[659.25,.25],[587.33,1]]}};let ctx=null,playing=null,timers=[];const stop=()=>{timers.forEach(clearTimeout);timers=[];if(ctx){ctx.close().catch(()=>{});ctx=null}if(playing){playing.textContent=playing.dataset.label||'▶ Play';playing=null}};const play=(name,btn)=>{if(playing===btn){stop();return}stop();const t=TRACKS[name];if(!t)return;ctx=new (window.AudioContext||window.webkitAudioContext)();playing=btn;btn.dataset.label=btn.textContent;btn.textContent='■ Stop';let when=ctx.currentTime+.05;t.notes.forEach(([f,d])=>{const o=ctx.createOscillator(),g=ctx.createGain();o.type='triangle';o.frequency.value=f;g.gain.setValueAtTime(0,when);g.gain.linearRampToValueAtTime(.12,when+.03);g.gain.exponentialRampToValueAtTime(.001,when+d*.9);o.connect(g);g.connect(ctx.destination);o.start(when);o.stop(when+d);when+=d});timers.push(setTimeout(stop,Math.max(1000,(when-ctx.currentTime)*1000)))};document.addEventListener('click',e=>{const b=e.target.closest('[data-quad-track]');if(!b)return;e.preventDefault();play(b.dataset.quadTrack,b)});})();(()=>{document.addEventListener('click',e=>{const b=e.target.closest('[data-toggle-password]');if(!b)return;const f=document.getElementById(b.dataset.togglePassword);if(!f)return;const show=f.type==='password';f.type=show?'text':'password';b.textContent=show?'Hide':'Show';f.focus()});const pw=document.getElementById('register-password')||document.getElementById('new-password');const bar=document.getElementById('pw-meter-bar');const hint=document.getElementById('pw-hint');if(pw&&bar){const upd=()=>{const v=pw.value;let s=0;if(v.length>=12)s+=40;else s+=Math.min(40,v.length*3);if(/[a-z]/.test(v)&&/[A-Z]/.test(v))s+=20;if(/\\d/.test(v))s+=20;if(/[^A-Za-z0-9]/.test(v))s+=20;bar.style.width=Math.min(100,s)+'%';if(hint)hint.textContent=v.length<12?'Use 12+ characters — a phrase you can remember works well.':s<60?'Good — longer or more varied is stronger.':s<90?'Strong password.':'Great — that looks strong.'};pw.addEventListener('input',upd);upd()}})();
 })();"""
-            body=js.encode('utf-8');self.send_response(200);self.send_header('Content-Type','application/javascript; charset=utf-8');self.send_header('Content-Length',str(len(body)));self.security_headers('private, max-age=300');self.end_headers();self.wfile.write(body);return
+            body=js.encode('utf-8');self.send_response(200);self.send_header('Content-Type','application/javascript; charset=utf-8');self.send_header('Content-Length',str(len(body)));self.security_headers('private, max-age=300');self.end_headers();self._write(body);return
         if path.startswith('/media/'):
             if not user:self.html('Sign in required.',401);return
             key=urllib.parse.unquote(path[len('/media/'):])
@@ -1169,7 +1319,7 @@ class Handler(BaseHTTPRequestHandler):
                     # file 404s. Never crash the request for it.
                     data=None
                 if data is None:self.html('Not found.',404);return
-                self.send_response(200);self.send_header('Content-Type',row['content_type']);self.send_header('Content-Length',str(len(data)));self.send_header('Content-Disposition','inline');self.security_headers('private, max-age=3600');self.end_headers();self.wfile.write(data)
+                self.send_response(200);self.send_header('Content-Type',row['content_type']);self.send_header('Content-Length',str(len(data)));self.send_header('Content-Disposition','inline');self.security_headers('private, max-age=3600');self.end_headers();self._write(data)
                 return
             target=UPLOAD_DIR/key
             if not target.is_file():self.html('Not found.',404);return
@@ -1178,7 +1328,7 @@ class Handler(BaseHTTPRequestHandler):
                 while True:
                     chunk=media_file.read(65536)
                     if not chunk:break
-                    self.wfile.write(chunk)
+                    self._write(chunk)
             return
         if path=='/login':
             if user:return self.go('/')
@@ -1562,7 +1712,7 @@ class Handler(BaseHTTPRequestHandler):
                 'groups':[dict(r) for r in c.execute('SELECT g.* FROM groups g JOIN group_members m ON m.group_id=g.id WHERE m.user_id=?',(user['id'],)).fetchall()],
             }
         body=json.dumps(data,ensure_ascii=False,indent=2).encode('utf-8')
-        self.send_response(200);self.send_header('Content-Type','application/json; charset=utf-8');self.send_header('Content-Disposition','attachment; filename="the-campus-export.json"');self.send_header('Content-Length',str(len(body)));self.security_headers();self.end_headers();self.wfile.write(body)
+        self.send_response(200);self.send_header('Content-Type','application/json; charset=utf-8');self.send_header('Content-Disposition','attachment; filename="the-campus-export.json"');self.send_header('Content-Length',str(len(body)));self.security_headers();self.end_headers();self._write(body)
     def profile(self,user):
         with connect() as c:
             u=user_by_id(c,user['id'])
@@ -1916,6 +2066,20 @@ class Handler(BaseHTTPRequestHandler):
             raise
         return key, ctype
     def do_POST(self):
+        # Update 15: same top-level guard as do_GET (above). A DB
+        # error during login/register/posting used to escape with
+        # no response at all (nginx 502, and the visitor could not
+        # tell whether their post or account had landed). Now it
+        # is a 500 page; the write itself either committed or it
+        # did not, and the visitor can retry.
+        try:
+            self._do_POST()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:
+            print('do_POST failed:', type(exc).__name__, exc)
+            self._safe_error(500)
+    def _do_POST(self):
         path=urllib.parse.urlparse(self.path).path;user,token=self.session()
         if not self.same_origin_request():
             return self.html(shell('Request rejected','<section class="card">Cross-site request rejected.</section>',user),403)
@@ -1979,7 +2143,7 @@ class Handler(BaseHTTPRequestHandler):
                 with connect() as c:
                     account=c.execute('SELECT id FROM users WHERE email=?',(email,)).fetchone()
                     if account and consume_recovery_code(c,account['id'],code):
-                        c.execute('UPDATE users SET password_hash=?,must_change_password=<redacted> WHERE id=?',(password_hash(pwd),account['id']))
+                        c.execute('UPDATE users SET password_hash=?,must_change_password=0 WHERE id=?',(password_hash(pwd),account['id']))
                         c.execute('DELETE FROM sessions WHERE user_id=?',(account['id'],))
                         c.execute('DELETE FROM password_reset_codes WHERE user_id=?',(account['id'],))
                         audit_event(c,account['id'],'password_reset','user',account['id'],{'method':'recovery_code'})
@@ -2628,15 +2792,50 @@ class NetworkHTTPServer(ThreadingHTTPServer):
     daemon_threads=True
     allow_reuse_address=True
     request_queue_size=128
+    def handle_error(self, request, client_address):
+        # Update 15: a visitor closing the tab mid-response used to
+        # dump a BrokenPipeError traceback into the Render logs on
+        # every abandoned page (live, 2026-11-19) — that is normal
+        # for a web server, not a bug, and it must not look like
+        # one. (This override belongs on the *server*, not the
+        # handler: socketserver calls the server's handle_error,
+        # BaseHTTPRequestHandler has no such method at all.)
+        # Swallow disconnects silently; log everything else
+        # exactly as the stdlib would.
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
 
 
 def main():
     if not 1<=PORT<=65535:raise ValueError('PORT must be between 1 and 65535.')
-    init_db()
-    with connect() as c:
-        check=c.execute('PRAGMA quick_check').fetchone()[0]
-        if check!='ok':raise RuntimeError('SQLite integrity check failed: %s'%check)
-    backup_database()
+    # Update 14: bind the listening socket FIRST, then check the
+    # database. The live failure of 2026-11-19 was a process that
+    # died in init_db()/quick_check (malformed replica) before it
+    # ever bound 8081, so nginx got 'connection refused' on
+    # /healthz and there was no app alive to answer anything.
+    # Binding first means the socket exists while the DB gate
+    # runs; if the gate rebuilds the replica, serving starts
+    # straight after, and if the gate cannot heal the DB, main()
+    # exits loudly (FATAL in the log, Render restarts) instead of
+    # leaving nginx proxying to a dead process indefinitely.
+    srv=NetworkHTTPServer((HOST,PORT),Handler)
+    try:
+        ensure_database_healthy()
+    except Exception:
+        srv.server_close()
+        raise
+    # Update 15: the startup backup used to run synchronously
+    # here, before serve_forever — it syncs the Turso replica
+    # and copies the database, which on a slow first start can
+    # add many seconds between binding the port and answering
+    # /healthz (and start.sh waits on /healthz, and Render's
+    # health check waits on nginx). A backup is not worth
+    # delaying the first response for; run it in the background
+    # once the server is about to serve. The shutdown backup in
+    # the finally block below is unchanged.
+    threading.Thread(target=backup_database, name='database-backup-startup', daemon=True).start()
     threading.Thread(target=backup_worker,name='database-backups',daemon=True).start()
     if os.environ.get('SMTP_HOST') and os.environ.get('SMTP_FROM'):
         print('Password reset email delivery is enabled.')
@@ -2658,7 +2857,7 @@ def main():
         print('Object storage: enabled (%s/%s)'%(cfg['endpoint'],cfg['bucket']))
     else:
         print('Object storage: not configured — uploads stay on local disk (lost on Render free restarts).')
-    srv=NetworkHTTPServer((HOST,PORT),Handler)
+    # srv was bound at the top of main() (Update 14) — do not bind twice.
     def request_shutdown(signum=None,frame=None):
         print('Shutdown requested; finishing active requests.')
         threading.Thread(target=srv.shutdown,daemon=True).start()

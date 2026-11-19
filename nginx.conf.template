@@ -31,6 +31,7 @@ http {
 
         location = /healthz {
             proxy_pass http://network_backend;
+            proxy_connect_timeout 5s;
             proxy_set_header Host $host;
             proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
         }
@@ -45,6 +46,13 @@ http {
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+            # Update 15: fail fast if the app is not listening yet
+            # (5s instead of nginx's 60s default) so a request
+            # during a restart gets a quick 502 and can be
+            # retried, instead of hanging for a minute. start.sh
+            # already waits for /healthz before starting nginx,
+            # so in normal operation this should never trigger.
+            proxy_connect_timeout 5s;
             proxy_read_timeout 60s;
             proxy_send_timeout 60s;
             proxy_pass http://network_backend;

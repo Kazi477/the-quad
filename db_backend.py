@@ -63,27 +63,133 @@ import os
 import shutil
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 # ---------------------------------------------------------------- env
 TURSO_DATABASE_URL = os.environ.get('TURSO_DATABASE_URL', '').strip()
 TURSO_AUTH_TOKEN = os.environ.get('TURSO_AUTH_TOKEN', '').strip()
 
-# Markers for the WAL/write errors the live site hit (see connect_turso).
+# Markers for the replica errors that mean 'the local file cannot
+# be written/read right now' (as opposed to a real SQL/programming
+# error). Update 13 covered the WAL/lock half; Update 14 adds the
+# corruption half — see _is_corrupt_error below.
 _WAL_ERROR_MARKERS = ('wal_insert_begin', 'database is locked',
                       'database is busy', 'wal', 'busy', 'locked',
                       'cannot start a transaction within a transaction')
+# A local replica file whose header/pages are torn by an unclean
+# Render spin-down comes back as one of these. libSQL/SQLite raise
+# them as plain errors (often ValueError from the Rust driver,
+# translated to sqlite3.Error by _translate_error), so match on
+# the message text, exactly as for the WAL markers.
+_CORRUPT_ERROR_MARKERS = ('malformed', 'file is not a database',
+                          'not a database',
+                          'database disk image is malformed',
+                          'database is malformed',
+                          'disk image malformed', 'file is encrypted',
+                          'database file is damaged')
+_RECOVERABLE_DB_ERRORS = _WAL_ERROR_MARKERS + _CORRUPT_ERROR_MARKERS
 # The WAL self-check (below) runs once per process, guarded by this
 # lock so concurrent first requests cannot run recovery twice.
 _WAL_PROBE_LOCK = threading.Lock()
 _WAL_PROBE_DONE = False
+# Update 15: recovery (quarantine + rebuild from Turso) is also
+# serialised. Without this, several request threads hitting a
+# corrupt replica at once each rebuild it — each one quarantining
+# the file the previous thread just rebuilt — which is slow and
+# noisy, and can leave a half-rebuilt file behind. The lock is
+# only held while a rebuild is actually happening, never on the
+# normal (healthy) path.
+_RECOVERY_LOCK = threading.Lock()
+
+
+def _is_corrupt_error(exc):
+    """True for 'the local database file itself is damaged'
+    (torn header/pages from an unclean shutdown), as opposed to a
+    transient WAL/lock failure. A corrupt local replica can be
+    rebuilt from Turso; a corrupt local-only file cannot, so the
+    distinction matters for the 'never delete the only copy' rule."""
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _CORRUPT_ERROR_MARKERS)
 
 
 def _is_wal_error(exc):
-    """True for the WAL/lock errors that mean 'the replica cannot
-    write right now' (as opposed to a real SQL/programming error)."""
+    """True for the WAL/lock errors AND the corruption errors that
+    mean 'the replica cannot be used right now' (as opposed to a
+    real SQL/programming error). Both are recoverable the same way
+    when a Turso cloud copy exists to rebuild from; the corruption
+    check in _is_corrupt_error is what gates the rebuild itself."""
     msg = str(exc).lower()
-    return any(marker in msg for marker in _WAL_ERROR_MARKERS)
+    return any(marker in msg for marker in _RECOVERABLE_DB_ERRORS)
+
+
+def _quarantine_local_file(db_path):
+    """Move a damaged local replica file (and its -wal/-shm
+    sidecars) aside as ``<path>.corrupt-<timestamp>`` instead of
+    deleting it. The quarantined copy is forensic evidence of
+    what went wrong, and on the ephemeral Render disk it costs
+    nothing — it is wiped with the rest of /tmp on the next
+    restart anyway. Returns the paths moved."""
+    stamp = time.strftime('%Y%m%d-%H%M%S', time.gmtime())
+    moved = []
+    for suffix in ('', '-wal', '-shm'):
+        src = Path(str(db_path) + suffix)
+        if not src.exists():
+            continue
+        dst = Path(str(db_path) + suffix + '.corrupt-' + stamp)
+        try:
+            if dst.exists():
+                dst = Path(str(dst) + '.1')
+            src.rename(dst)
+            moved.append(str(dst))
+        except OSError:
+            # Fall back to deleting only this sidecar file; the
+            # main file is never silently deleted by this helper.
+            if suffix:
+                try:
+                    src.unlink()
+                    moved.append(str(src) + ' (deleted)')
+                except OSError:
+                    pass
+    return moved
+
+
+def _rebuild_replica(db_path, sync_url, auth_token):
+    """Quarantine a damaged local replica and open a fresh one
+    from Turso. Only ever called when ``sync_url`` is a real
+    ``libsql://`` URL — the cloud primary is the source of truth,
+    so a fresh sync rebuilds the data. Raises sqlite3.Error if
+    there is no cloud copy to rebuild from, or the fresh open
+    fails. Returns the raw libSQL connection (caller wraps it)."""
+    if not (sync_url and sync_url.startswith('libsql://')):
+        raise sqlite3.Error(
+            'Local database file is damaged and there is no cloud '
+            'database to rebuild it from')
+    moved = _quarantine_local_file(db_path)
+    print('Turso replica damaged; quarantined %s and rebuilding '
+          'the local file from Turso...' % (moved or 'nothing',))
+    return _open_raw(db_path, sync_url=sync_url, auth_token=auth_token)
+
+
+def rebuild_replica(db_path, sync_url, auth_token):
+    """Public rebuild used by the app's startup check (main):
+    quarantine the damaged local file, re-sync a fresh replica
+    from Turso, apply the pragmas and prove it is healthy with a
+    WAL checkpoint + integrity check. Returns a usable wrapped
+    connection. Raises sqlite3.Error if the rebuild is not
+    possible (no cloud copy) or the fresh replica is still bad —
+    the caller must then fail loudly, never serve on a broken DB."""
+    raw = _rebuild_replica(db_path, sync_url, auth_token)
+    conn = _Connection(raw, db_path, sync_url=sync_url,
+                       auth_token=auth_token)
+    try:
+        _apply_pragmas(conn)
+        _wal_self_check(conn)
+    except Exception:
+        conn.close()
+        raise
+    print('Turso replica rebuilt from Turso; database is healthy again.')
+    return conn
 
 
 def _remove_stale_wal_files(db_path):
@@ -331,6 +437,27 @@ def _wal_self_check(conn):
         if _is_wal_error(exc):
             raise
         print('wal_checkpoint skipped:', type(exc).__name__, exc)
+        return
+    # Update 14: a checkpoint can pass on a file whose pages are
+    # already torn — the live 'malformed SQLite database' of
+    # 2026-11-19 opened fine for reads and only failed later, in
+    # main()'s quick_check, after which the process died before
+    # binding its port (nginx: connection refused on 127.0.0.1:8081).
+    # So the probe also runs quick_check here: any result other
+    # than 'ok' is corruption and must trigger the same recovery
+    # as a WAL failure. The DB is tiny on the free tier, so this
+    # check is cheap; it runs once per process, in this probe.
+    try:
+        row = conn.execute('PRAGMA quick_check').fetchone()
+        result = row[0] if row is not None else 'no result'
+    except Exception as exc:
+        if _is_corrupt_error(exc) or _is_wal_error(exc):
+            raise
+        print('quick_check skipped:', type(exc).__name__, exc)
+        return
+    if result != 'ok':
+        raise sqlite3.Error(
+            'database disk image is malformed: %s' % result)
 
 
 def connect_turso(db_path, sync_url=None, auth_token=''):
@@ -374,16 +501,63 @@ def connect_turso(db_path, sync_url=None, auth_token=''):
             raw = _open_raw(db_path, sync_url=sync_url,
                             auth_token=auth_token)
         except Exception as exc2:
-            raise sqlite3.Error(
-                'Could not open Turso database (sync failed?): %s'
-                % exc2) from None
+            # Update 14: a corrupt main file (torn header/pages —
+            # 'file is not a database' / 'malformed') is NOT healed
+            # by removing sidecars. If Turso can supply the data
+            # again, quarantine the damaged file and rebuild from
+            # the cloud; otherwise fail loudly and keep the file
+            # (local mode: it is the only copy).
+            # Update 15: the same applies to a WAL failure on the
+            # second open — removing sidecars did not heal it, so
+            # a rebuild is the only remaining recovery, not a
+            # plain raise. (Live, 2026-11-19: wal_insert_begin
+            # kept recurring after the restart even though the
+            # homepage loaded, so an open that still cannot write
+            # must be healed, not just reported.)
+            if _is_wal_error(exc2):
+                try:
+                    with _RECOVERY_LOCK:
+                        raw = _rebuild_replica(db_path, sync_url,
+                                               auth_token)
+                except Exception as exc3:
+                    raise sqlite3.Error(
+                        'Could not open Turso database (local file '
+                        'is damaged and could not be rebuilt): %s'
+                        % exc3) from None
+            else:
+                raise sqlite3.Error(
+                    'Could not open Turso database (sync failed?): %s'
+                    % exc2) from None
     conn = _Connection(raw, db_path, sync_url=sync_url,
                        auth_token=auth_token)
     try:
         _apply_pragmas(conn)
-    except Exception:
+    except Exception as exc:
+        # Update 14: pragmas run against the file too, so a torn
+        # replica can fail here instead of in the probe. Same
+        # recovery as everywhere else: rebuild from Turso when a
+        # cloud copy exists, otherwise fail loudly.
+        # Update 15: serialised under _RECOVERY_LOCK, and a fresh
+        # open is tried first inside the lock — another request
+        # thread may already have healed the replica, in which
+        # case rebuilding again would quarantine a healthy file
+        # for no reason.
         conn.close()
-        raise
+        if _is_wal_error(exc) and sync_url and sync_url.startswith('libsql://'):
+            with _RECOVERY_LOCK:
+                try:
+                    raw = _open_raw(db_path, sync_url=sync_url,
+                                    auth_token=auth_token)
+                    conn = _Connection(raw, db_path, sync_url=sync_url,
+                                       auth_token=auth_token)
+                    _apply_pragmas(conn)
+                except Exception:
+                    raw = _rebuild_replica(db_path, sync_url, auth_token)
+                    conn = _Connection(raw, db_path, sync_url=sync_url,
+                                       auth_token=auth_token)
+                    _apply_pragmas(conn)
+        else:
+            raise
     global _WAL_PROBE_DONE
     if not _WAL_PROBE_DONE:
         with _WAL_PROBE_LOCK:
@@ -412,8 +586,17 @@ def _wal_probe_or_recover(conn, db_path, sync_url, auth_token):
     try:
         raw = _open_raw(db_path, sync_url=sync_url, auth_token=auth_token)
     except Exception as exc:
-        raise sqlite3.Error(
-            'Could not open Turso database (sync failed?): %s' % exc) from None
+        # Update 15: if the file still will not open after the
+        # sidecars are gone, the main file itself is damaged —
+        # rebuild from Turso when a cloud copy exists instead of
+        # giving up here (the probe's rebuild step below never
+        # gets a chance otherwise).
+        if _is_wal_error(exc) and sync_url and sync_url.startswith('libsql://'):
+            with _RECOVERY_LOCK:
+                raw = _rebuild_replica(db_path, sync_url, auth_token)
+        else:
+            raise sqlite3.Error(
+                'Could not open Turso database (sync failed?): %s' % exc) from None
     conn = _Connection(raw, db_path, sync_url=sync_url,
                        auth_token=auth_token)
     try:
@@ -437,16 +620,9 @@ def _wal_probe_or_recover(conn, db_path, sync_url, auth_token):
     print('Turso replica still unusable; rebuilding the local file '
           'from Turso (cloud copy is the source of truth)...')
     conn.close()
-    for suffix in ('', '-wal', '-shm'):
-        try:
-            Path(str(db_path) + suffix).unlink(missing_ok=True)
-        except OSError:
-            pass
-    try:
-        raw = _open_raw(db_path, sync_url=sync_url, auth_token=auth_token)
-    except Exception as exc:
-        raise sqlite3.Error(
-            'Could not open Turso database (sync failed?): %s' % exc) from None
+    # Update 14: quarantine the damaged file instead of deleting
+    # it outright, so the torn copy survives for forensics.
+    raw = _rebuild_replica(db_path, sync_url, auth_token)
     conn = _Connection(raw, db_path, sync_url=sync_url,
                        auth_token=auth_token)
     _apply_pragmas(conn)

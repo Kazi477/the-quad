@@ -129,6 +129,60 @@ sync), so a wiped Render disk just re-syncs from Turso on startup.
   sidecars (and, only with a real libsql:// URL, rebuilds the
   local file from Turso). Needs a redeploy after approval; verify
   GET / still returns 200 after the first sleep/wake.
+* **Live connection refused + malformed DB — FIXED in Update 14
+  (dev only, 2026-11-19, not deployed yet).** After the Update 13
+  redeploy the homepage loaded once, a dummy registration showed
+  success, then 502s came back. Mitchell spotted the key log
+  line: nginx `connect() failed (111: Connection refused) while
+  connecting to upstream ... GET /healthz ... upstream:
+  http://127.0.0.1:8081/healthz`, and the app logs reported a
+  malformed SQLite database. Cause: a replica file whose
+  header/pages are torn by an unclean spin-down comes back as
+  "file is not a database" / "database disk image is malformed";
+  Update 13 only treated WAL/lock errors as recoverable, and
+  main() ran init_db() + quick_check BEFORE binding its port, so
+  the process died before it ever listened on 8081 — nginx was
+  up, nothing was listening, and the app could not even answer
+  /healthz with 503. Fixed in dev: 'malformed' / 'not a
+  database' are now recoverable corruption (same recovery as
+  WAL errors, with the damaged file quarantined as
+  `<file>.corrupt-<timestamp>` instead of deleted); the startup
+  self-check now also runs PRAGMA quick_check; main() binds the
+  port FIRST and then runs a new ensure_database_healthy() gate
+  that rebuilds the replica from Turso once if the check fails
+  and fails loudly (FATAL in the log, process exits, Render
+  restarts) if it cannot; and start.sh waits for the app to
+  answer /healthz 200 before starting nginx, so a startup race
+  can no longer produce the connection-refused line. The dummy
+  account from that night is UNCONFIRMED — it may or may not
+  have been created before the 502s returned, so the live test
+  must re-run it from scratch after this deploy.
+* **Fix-all pass — FIXED in Update 15 (dev only, 2026-11-19, not
+  deployed yet).** A full audit of the request handlers, DB writes,
+  uploads, auth, rate limiting, Turso sync and startup found and
+  fixed: (1) the recovery-code password reset had a literally
+  broken SQL statement (`must_change_password=<redacted>`) since
+  Update 7 — recovery codes are the only working reset path
+  (no SMTP), so no recovery-code reset has ever worked; fixed to
+  `=0`, and the test that hid it now fails loudly instead of
+  printing a false pass when it crashes partway; (2) WAL/malformed
+  recovery gaps in db_backend (rebuild also on WAL failure on
+  re-open, rebuilds serialised under a lock, fresh-open check
+  before rebuilding, rate_limit treats malformed as transient);
+  (3) start.sh no longer starts nginx when the app never becomes
+  healthy — it exits so Render restarts the container; startup
+  DB backup moved to a background thread; nginx
+  `proxy_connect_timeout 5s` so a restart fails fast; (4) client
+  disconnects mid-send (BrokenPipeError) are now swallowed
+  silently instead of printing tracebacks; (5) any handler crash
+  now returns a real 500 page instead of a dropped connection
+  (nginx 502), /healthz is answered before the guarded handler so
+  it survives a handler crash, and session()/shell() degrade
+  gracefully when the DB is down. 568 checks + smoke PASS, 0
+  failed. Needs a redeploy after approval; verify GET / 200,
+  /healthz ok, re-run the dummy-account live test from scratch
+  including a recovery-code reset, then check GET / after a
+  sleep/wake.
 * **APP_SECRET must stay stable.** It is generated once by Render
   (`generateValue: true`). If it is ever regenerated, every
   signed-in user is logged out and reset links break.

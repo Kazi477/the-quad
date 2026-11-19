@@ -309,10 +309,18 @@ finally:
     except subprocess.TimeoutExpired:
         p.kill(); p.wait()
     out = p.stdout.read() if p.stdout else ''
-    print(out[-1500:])
+    print(out[-9000:])
     shutil.rmtree(DATA, ignore_errors=True)
     failed = [r for r in results if not r[1]]
     print('FORGOT TEST: %d passed, %d failed' % (len(results) - len(failed), len(failed)))
     if failed:
         print('FAILED:', [r[0] for r in failed])
+    # Update 15: never report a pass when the run crashed partway.
+    # Before this, an exception mid-run (e.g. the server dropping the
+    # connection on a broken SQL statement) was swallowed by this
+    # finally block, which printed e.g. "29 passed, 0 failed" and
+    # exited 0 even though the recovery-code checks never ran.
+    if sys.exc_info()[0] is not None:
+        print('FORGOT TEST CRASHED before completing all checks')
+        sys.exit(1)
     sys.exit(1 if failed else 0)
