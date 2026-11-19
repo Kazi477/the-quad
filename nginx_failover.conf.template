@@ -1,0 +1,68 @@
+worker_processes auto;
+pid /tmp/nginx.pid;
+error_log /dev/stderr warn;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    access_log /dev/stdout combined;
+    server_tokens off;
+
+    client_max_body_size 27m;
+    client_body_timeout 30s;
+    send_timeout 60s;
+    keepalive_timeout 15s;
+
+    limit_req_zone $binary_remote_addr zone=network_req:10m rate=20r/s;
+    limit_conn_zone $binary_remote_addr zone=network_conn:10m;
+
+    # Dual backend (Update 8): two Python processes share ONE SQLite
+    # database file in the same DATA_DIR (WAL mode), so both see the
+    # same accounts/posts/sessions. The second backend is marked
+    # `backup`: nginx only sends it traffic when the primary is
+    # unavailable (connection refused / timeout / 502 / 503 / 504).
+    # Open-source nginx has no active health checks; this is passive
+    # failover — a dead primary is detected when a request to it fails,
+    # and `max_fails`/`fail_timeout` keep it out of rotation briefly.
+    # Both backends MUST run with the same DATA_DIR and the same
+    # APP_SECRET, or sessions/CSRF/reset tokens will not work across
+    # the failover. See DUAL_BACKEND.md.
+    upstream quad_backend {
+        server 127.0.0.1:${BACKEND_PORT} max_fails=2 fail_timeout=10s;
+        server 127.0.0.1:${BACKEND_PORT_SECONDARY} backup;
+        keepalive 16;
+    }
+
+    server {
+        listen ${PORT};
+        server_name _;
+
+        location = /healthz {
+            proxy_pass http://quad_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+        }
+
+        location / {
+            limit_req zone=network_req burst=60 nodelay;
+            limit_conn network_conn 20;
+
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+            proxy_read_timeout 60s;
+            proxy_send_timeout 60s;
+            # On primary failure, try the next upstream (the backup).
+            proxy_next_upstream error timeout http_502 http_503 http_504;
+            proxy_next_upstream_tries 2;
+            proxy_pass http://quad_backend;
+        }
+    }
+}

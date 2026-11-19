@@ -132,6 +132,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS user_settings(user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,private_account INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS blocks(blocker_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,blocked_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,created REAL NOT NULL,PRIMARY KEY(blocker_id,blocked_id));
         CREATE TABLE IF NOT EXISTS password_reset_codes(user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,code_hash TEXT NOT NULL,expires REAL NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,created REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS recovery_codes(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,code_hash TEXT NOT NULL,used INTEGER NOT NULL DEFAULT 0,created REAL NOT NULL,used_at REAL);
+        CREATE INDEX IF NOT EXISTS recovery_codes_user_idx ON recovery_codes(user_id,used);
         CREATE TABLE IF NOT EXISTS password_reset_limits(email_hash TEXT PRIMARY KEY,window_start REAL NOT NULL,request_count INTEGER NOT NULL,last_sent REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS rate_limits(action TEXT NOT NULL,key_hash TEXT NOT NULL,window_start REAL NOT NULL,request_count INTEGER NOT NULL,last_seen REAL NOT NULL,PRIMARY KEY(action,key_hash));
         CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT,actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,action TEXT NOT NULL,target_type TEXT NOT NULL,target_id TEXT,metadata TEXT NOT NULL DEFAULT '{}',created REAL NOT NULL);
@@ -471,7 +473,12 @@ def audit_event(c, actor_user_id, action, target_type, target_id=None, metadata=
 def backup_database():
     """Create a consistent SQLite backup and keep the newest seven copies."""
     stamp=time.strftime('%Y%m%d-%H%M%S',time.gmtime())
-    target=BACKUP_DIR/('network-%s.db'%stamp)
+    # Port in the name (Update 8, dual backend): with two backends
+    # sharing one DATA_DIR, both take startup/shutdown backups; without
+    # this they could target the same file in the same second and one
+    # backup would overwrite/clash with the other. Retention (newest 7,
+    # network-*.db) is unchanged.
+    target=BACKUP_DIR/('network-%s-p%s.db'%(stamp,PORT))
     try:
         src=connect();dst=sqlite3.connect(str(target))
         with dst:src.backup(dst)
@@ -747,12 +754,66 @@ def send_reset_email(recipient, code):
 
 
 def deliver_reset_email_async(user_id, recipient, code):
-    """Keep slow SMTP connections from holding the password-reset page open."""
+    """Keep slow SMTP connections from holding the password-reset page open.
+
+    If delivery fails the code row is kept (it expires in 10 minutes and a
+    new request overwrites it). Deleting it on failure used to leave the
+    user staring at a "code is being sent" message for a code that no
+    longer existed — see MERGE_NOTES Update 7.
+    """
     def deliver():
-        if not send_reset_email(recipient,code):
-            with connect() as c:c.execute('DELETE FROM password_reset_codes WHERE user_id=?',(user_id,))
-    worker=threading.Thread(target=deliver,name='password-reset-email',daemon=True)
+        if not send_reset_email(recipient, code):
+            print('Password reset email could not be delivered; code kept until it expires.')
+    worker = threading.Thread(target=deliver, name='password-reset-email', daemon=True)
     worker.start()
+
+
+# Recovery codes (Update 7): the fallback when SMTP is not configured.
+# A signed-in user creates 10 one-time codes in Settings; each code is
+# shown ONCE, in the response that creates it, and only its PBKDF2 hash
+# is stored — the plaintext is never saved, logged or emailed. A code is
+# 12 characters from an unambiguous alphabet (no 0/O/1/I), displayed as
+# XXXX-XXXX-XXXX. A locked-out user enters one on the reset page instead
+# of an emailed code; it works any time until used, then it is consumed.
+RECOVERY_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+RECOVERY_CODE_COUNT = 10
+
+def new_recovery_code():
+    raw = ''.join(secrets.choice(RECOVERY_CODE_ALPHABET) for _ in range(12))
+    return '%s-%s-%s' % (raw[:4], raw[4:8], raw[8:])
+
+def normalise_recovery_code(raw):
+    return re.sub(r'[\s\-]', '', str(raw or '')).upper()
+
+def generate_recovery_codes(c, user_id):
+    """Replace all of a user's recovery codes with a fresh set of 10.
+
+    Returns the plaintext codes (shown once to the signed-in owner).
+    Old codes stop working immediately.
+    """
+    codes = [new_recovery_code() for _ in range(RECOVERY_CODE_COUNT)]
+    now = time.time()
+    c.execute('DELETE FROM recovery_codes WHERE user_id=?', (user_id,))
+    for code in codes:
+        c.execute('INSERT INTO recovery_codes(user_id,code_hash,used,created) VALUES(?,?,0,?)',
+                  (user_id, password_hash(normalise_recovery_code(code)), now))
+    return codes
+
+def count_unused_recovery_codes(c, user_id):
+    row = c.execute('SELECT COUNT(*) FROM recovery_codes WHERE user_id=? AND used=0', (user_id,)).fetchone()
+    return row[0] if row else 0
+
+def consume_recovery_code(c, user_id, raw):
+    """True (and the code marked used) when raw matches an unused code."""
+    norm = normalise_recovery_code(raw)
+    if len(norm) != 12 or not all(ch in RECOVERY_CODE_ALPHABET for ch in norm):
+        return False
+    rows = c.execute('SELECT id,code_hash FROM recovery_codes WHERE user_id=? AND used=0', (user_id,)).fetchall()
+    for row in rows:
+        if check_password(norm, row['code_hash']):
+            c.execute('UPDATE recovery_codes SET used=1,used_at=? WHERE id=?', (time.time(), row['id']))
+            return True
+    return False
 
 
 REGISTRATION_NOTICE = ('<section class="card"><h1>Thanks — check your next step</h1>'
@@ -938,21 +999,26 @@ class Handler(BaseHTTPRequestHandler):
         self.html(shell('Not found','<section class="card"><h1>Page not found</h1><a href="/">Back to feed</a></section>',user),404)
     def forgot_password_page(self,message=''):
         notice='<p class="notice">%s</p>'%esc(message) if message else ''
-        content='<section class="card"><h1>Forgot password?</h1><p>We will email a six-digit code if this address belongs to an account and email delivery is configured.</p>%s<form method="post" action="/send-reset-code"><input type="hidden" name="reset_token" value="%s"><label>Email</label><input type="email" name="email" required maxlength="254" autocomplete="email"><button class="btn">Email me a code</button></form><p class="small"><a href="/">Back to sign in</a></p></section>'%(notice, reset_token('send-reset'))
+        mail_ready=bool(os.environ.get('SMTP_HOST')) and bool(os.environ.get('SMTP_FROM'))
+        if mail_ready:
+            how='<p>We will email a six-digit code if this address belongs to an account. The code expires in 10 minutes and can be used once.</p><p class="small">No email? If you saved recovery codes in Settings while you were signed in, you can use one of those instead — enter your email below, then use a recovery code on the next page. No email is needed for that.</p>'
+        else:
+            how='<p><b>Email delivery is not set up on this server yet, so an email code cannot be sent.</b> If you saved recovery codes in Settings while you were signed in, you can still get back in: enter your email below, then use one of your recovery codes on the next page — no email needed. If you never saved recovery codes, ask an admin to help: they can remove and restore your account, or you can sign in once you remember the password.</p>'
+        content='<section class="card"><h1>Forgot password?</h1>%s%s<form method="post" action="/send-reset-code"><input type="hidden" name="reset_token" value="%s"><label>Email</label><input type="email" name="email" required maxlength="254" autocomplete="email"><button class="btn">Continue</button></form><p class="small"><a href="/">Back to sign in</a></p></section>'%(how,notice, reset_token('send-reset'))
         return self.html(shell('Reset password',content))
-    def reset_password_form(self,email,message=''):
-        content = ('<section class="card"><h1>Enter your code</h1><p>Check your email. The code expires in 10 minutes. You have up to five attempts.</p>'
+    def reset_password_form(self,email,message='',status=200):
+        content = ('<section class="card"><h1>Enter your code</h1><p>Check your email for a six-digit code — it expires in 10 minutes and you have up to five attempts. <b>Or use a recovery code</b> you saved in Settings (looks like XXXX-XXXX-XXXX): it works any time until it is used, and no email is needed for that.</p>'
             '<p class="notice">%s</p>'
             '<form method="post" action="/reset-password"><input type="hidden" name="reset_token" value="%s">'
             '<label>Email</label><input type="email" name="email" value="%s" required maxlength="254" autocomplete="email">'
-            '<label>Six-digit code</label><input name="code" inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" required autocomplete="one-time-code">'
+            '<label>Six-digit email code or recovery code</label><input name="code" maxlength="20" required autocomplete="one-time-code" placeholder="123456 or XXXX-XXXX-XXXX">'
             '<label>New password (12+ characters)</label><input type="password" name="password" required minlength="12" maxlength="256" autocomplete="new-password">'
             '<label>Confirm new password</label><input type="password" name="confirm_password" required minlength="12" maxlength="256" autocomplete="new-password">'
             '<button class="btn">Reset password</button></form>'
             '<form method="post" action="/send-reset-code"><input type="hidden" name="reset_token" value="%s">'
             '<input type="hidden" name="email" value="%s"><button class="light">Send another code</button></form></section>'
             ) % (esc(message), reset_token('reset-password'), esc(email), reset_token('send-reset'), esc(email))
-        return self.html(shell('Reset password',content))
+        return self.html(shell('Reset password',content),status)
     def feed(self,user,sort='newest',page=0,feed_mode='all'):
         sort=sort if sort in ('newest','oldest','liked') else 'newest'
         feed_mode=feed_mode if feed_mode in ('all','following') else 'all'
@@ -989,6 +1055,12 @@ class Handler(BaseHTTPRequestHandler):
             notes_by_user={r['user_id']:r for r in note_rows}
             own_note=notes_by_user.get(user['id'])
         content='<section class="card quad-hero"><span class="eyebrow">The Quad</span><h2>Started in a dorm room. Now it\'s the whole quad.</h2><p>Your people, your posts, your music — all in one place on The Quad.</p></section><h1>Welcome, %s</h1>'%esc(display(user))
+        # One-time nudge (Update 7): recovery codes only help if the user
+        # created them while signed in. Shown only to the owner, on the
+        # first page of their own feed, until they have at least one.
+        with connect() as _c:
+            if page==0 and count_unused_recovery_codes(_c,user['id'])==0:
+                content+='<section class="card notice"><b>Save your recovery codes.</b> If you forget your password, a recovery code gets you back in — no email needed. It takes a minute in <a href="/settings">Settings → Password recovery</a>.</section>'
         if stories:
             content+='<section class="card"><h2>Quad moments</h2><div class="story-row">'
             for s in stories:
@@ -1422,16 +1494,31 @@ class Handler(BaseHTTPRequestHandler):
             '<p>Until those are set up with Mitchell\'s approval, this page will keep saying not connected — it will not fake a live status.</p>'
             '<p><a class="btn" href="/">Back to feed</a> <a class="btn light" href="/profile">Set a Listening Note instead</a></p></section>')
         return self.html(shell('Spotify live sync',content,user))
-    def settings(self,user):
+    def settings(self,user,show_codes=None):
         with connect() as c:
             row=c.execute('SELECT private_account FROM user_settings WHERE user_id=?',(user['id'],)).fetchone()
             private=bool(row['private_account']) if row else False
             blocked=c.execute('SELECT u.* FROM blocks b JOIN users u ON u.id=b.blocked_id WHERE b.blocker_id=? ORDER BY u.display_name,u.name',(user['id'],)).fetchall()
+            unused_codes=count_unused_recovery_codes(c,user['id'])
         checked=' checked' if private else ''
         content='<section class="card"><h1>Settings &amp; privacy</h1><p>Manage who can see your profile and the people you have blocked.</p><form method="post" action="/settings">%s<label class="row"><input type="checkbox" name="private_account"%s><span><b>Private account</b><br><small>Hides your bio, interests and posts from people who are not accepted friends.</small></span></label><button class="btn">Save settings</button></form></section><section class="card"><h2>Blocked people</h2>'%(form_csrf(user),checked)
         if not blocked: content+='<p class="muted">You have not blocked anyone.</p>'
         for m in blocked: content+='<div class="person">%s<b class="grow">%s</b><form method="post" action="/block">%s<input type="hidden" name="user_id" value="%s"><input type="hidden" name="action" value="unblock"><button class="light">Unblock</button></form></div>'%(avatar(m),esc(display(m)),form_csrf(user),m['id'])
-        content+='<section class="card"><h2>Change password</h2><p><a class="btn light" href="/change-password">Change your password</a></p></section><section class="card"><h2>Password recovery</h2><p>If you forget your password, the app can email a six-digit reset code. SMTP email delivery must be configured on the server for this feature to send mail.</p></section>'
+        content+='<section class="card"><h2>Change password</h2><p><a class="btn light" href="/change-password">Change your password</a></p></section>'
+        # Password recovery (Update 7): emailed code when SMTP is set up,
+        # plus one-time recovery codes the user creates here. The codes
+        # are shown ONCE, in the response that creates them (show_codes);
+        # only their hashes are stored, so Settings can never show old
+        # codes again — it can only count them or replace them.
+        mail_ready=bool(os.environ.get('SMTP_HOST')) and bool(os.environ.get('SMTP_FROM'))
+        content+='<section class="card"><h2>Password recovery</h2><p>If you forget your password, the app can email a six-digit reset code%s.</p>'%('' if mail_ready else ' — but email delivery is not set up on this server yet, so an email code cannot be sent right now')
+        if show_codes:
+            content+='<p class="notice"><b>Save these recovery codes now — they are shown once and never again.</b> Write them down or store them somewhere safe. Each code works once, any time, on the Forgot password page — no email needed. If you lose them, create a new set below and the old ones stop working.</p><p>'+'<br>'.join('<b>%s</b>'%esc(code) for code in show_codes)+'</p>'
+        elif unused_codes:
+            content+='<p>You have <b>%d unused recovery code%s</b>. They are not shown here — they were only shown once, when they were created.</p>'%(unused_codes,'' if unused_codes==1 else 's')
+        else:
+            content+='<p>You have no recovery codes yet. Create a set now, while you are signed in — if you forget your password later, one of these codes gets you back in without any email.</p>'
+        content+='<form method="post" action="/recovery-codes/regenerate" data-confirm="Create a new set of recovery codes? Any old codes you have not used will stop working.">%s<button class="btn">%s</button></form></section>'%(form_csrf(user),'Create new recovery codes' if not unused_codes else 'Create a new set (replaces old codes)')
         # Notification preferences (Update 6): per-kind on/off, in-app only.
         # Push notifications are NOT offered — they need a service worker,
         # VAPID keys and a push sender this server does not have.
@@ -1585,7 +1672,7 @@ class Handler(BaseHTTPRequestHandler):
             if mail_ready:
                 message='If this email belongs to an account, a code is being sent automatically. Check your inbox and spam folder.'
             else:
-                message='Email delivery is not configured on this server yet, so codes cannot be sent. Ask the administrator to configure mail.'
+                message='Email delivery is not configured on this server yet, so an email code cannot be sent. If you saved recovery codes in Settings, enter one of those on this page instead — no email needed. If you never saved recovery codes, ask an admin for help.'
             return self.reset_password_form(email,message)
         if path=='/reset-password':
             email=normalize_email(data.get('email',''));code=data.get('code','').strip()
@@ -1593,13 +1680,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reset_password_form(email,'That reset request expired or was invalid. Request a new code.')
             pwd=data.get('password','');confirm=data.get('confirm_password','')
             if not rate_limit('reset-verify-client',client_fp,30,600) or (email and not rate_limit('reset-verify-email',email,10,600)):
-                return self.reset_password_form(email,'Too many attempts. Wait a few minutes and request a new code.')
+                return self.reset_password_form(email,'Too many attempts. Wait a few minutes and request a new code.',429)
             if pwd!=confirm:
                 return self.reset_password_form(email,'Passwords do not match. Enter the same password twice.')
             pw_err=validate_password(pwd,'',email)
             if pw_err:
                 return self.reset_password_form(email,pw_err)
-            reset=False
+            reset=False;used_recovery=False
             if email and len(code)==6 and code.isdigit():
                 with connect() as c:
                     row=c.execute('SELECT r.user_id,r.code_hash,r.expires,r.attempts FROM password_reset_codes r JOIN users u ON u.id=r.user_id WHERE u.email=?',(email,)).fetchone()
@@ -1610,14 +1697,29 @@ class Handler(BaseHTTPRequestHandler):
                             c.execute('UPDATE users SET password_hash=?,recovery_hash=NULL,must_change_password=0 WHERE id=?',(password_hash(pwd),row['user_id']))
                             c.execute('DELETE FROM sessions WHERE user_id=?',(row['user_id'],))
                             c.execute('DELETE FROM password_reset_codes WHERE user_id=?',(row['user_id'],))
-                            audit_event(c,row['user_id'],'password_reset','user',row['user_id'])
+                            audit_event(c,row['user_id'],'password_reset','user',row['user_id'],{'method':'email_code'})
                             reset=True
                         else:
                             attempts=row['attempts']+1
                             if attempts>=5:c.execute('DELETE FROM password_reset_codes WHERE user_id=?',(row['user_id'],))
                             else:c.execute('UPDATE password_reset_codes SET attempts=? WHERE user_id=?',(attempts,row['user_id']))
+            elif email and len(normalise_recovery_code(code))==12:
+                # Recovery-code path (Update 7): no email code needed, no
+                # SMTP needed. The code is single-use; a wrong code gives
+                # the same generic error as a wrong email code, so the
+                # response never reveals whether the email has an account
+                # or whether a recovery code exists for it.
+                with connect() as c:
+                    account=c.execute('SELECT id FROM users WHERE email=?',(email,)).fetchone()
+                    if account and consume_recovery_code(c,account['id'],code):
+                        c.execute('UPDATE users SET password_hash=?,must_change_password=<redacted> WHERE id=?',(password_hash(pwd),account['id']))
+                        c.execute('DELETE FROM sessions WHERE user_id=?',(account['id'],))
+                        c.execute('DELETE FROM password_reset_codes WHERE user_id=?',(account['id'],))
+                        audit_event(c,account['id'],'password_reset','user',account['id'],{'method':'recovery_code'})
+                        reset=True;used_recovery=True
             if reset:
-                content='<section class="card"><p>Password reset. Sign in with your new password. The code has expired and cannot be reused.</p><a class="btn" href="/">Return to sign in</a></section>'
+                note=' One of your recovery codes was used up — you still have the rest, or you can create a new set in Settings.' if used_recovery else ' The code has expired and cannot be reused.'
+                content='<section class="card"><p>Password reset. Sign in with your new password.%s</p><a class="btn" href="/">Return to sign in</a></section>'%note
                 return self.html(shell('Reset password',content))
             return self.reset_password_form(email,'The code could not be verified or has expired. Request a new code and try again.')
         if path=='/register':
@@ -1694,7 +1796,7 @@ class Handler(BaseHTTPRequestHandler):
                 c.execute('DELETE FROM sessions WHERE user_id=? AND token<>?',(user['id'],token))
                 audit_event(c,user['id'],'password_change','user',user['id'],{'forced':bool(user['must_change_password'])})
             return self.go('/')
-        write_limits={'/posts':(30,3600),'/comment':(120,3600),'/message':(300,3600),'/friend':(120,3600),'/block':(60,3600),'/like':(300,3600),'/react':(300,3600),'/comment-react':(300,3600),'/edit-comment':(120,3600),'/repost':(30,3600),'/save':(120,3600),'/pin':(60,3600),'/profile':(30,3600),'/settings':(30,3600),'/delete':(120,3600),'/delete-comment':(120,3600),'/listening-note':(10,3600),'/admin/remove-user':(10,3600),'/admin/restore-user':(10,3600),'/group':(30,3600),'/group-action':(120,3600),'/group-post':(30,3600),'/event':(30,3600),'/event-rsvp':(120,3600),'/event-invite':(60,3600),'/poll':(30,3600),'/poll-vote':(120,3600),'/report':(20,3600),'/admin/report-action':(60,3600),'/notification-prefs':(30,3600),'/notifications/read-all':(60,3600),'/account/delete':(5,3600)}
+        write_limits={'/posts':(30,3600),'/comment':(120,3600),'/message':(300,3600),'/friend':(120,3600),'/block':(60,3600),'/like':(300,3600),'/react':(300,3600),'/comment-react':(300,3600),'/edit-comment':(120,3600),'/repost':(30,3600),'/save':(120,3600),'/pin':(60,3600),'/profile':(30,3600),'/settings':(30,3600),'/delete':(120,3600),'/delete-comment':(120,3600),'/listening-note':(10,3600),'/admin/remove-user':(10,3600),'/admin/restore-user':(10,3600),'/group':(30,3600),'/group-action':(120,3600),'/group-post':(30,3600),'/event':(30,3600),'/event-rsvp':(120,3600),'/event-invite':(60,3600),'/poll':(30,3600),'/poll-vote':(120,3600),'/report':(20,3600),'/admin/report-action':(60,3600),'/notification-prefs':(30,3600),'/notifications/read-all':(60,3600),'/account/delete':(5,3600),'/recovery-codes/regenerate':(5,3600)}
         if path in write_limits:
             limit,window=write_limits[path]
             if not rate_limit('write:'+path,'%s:%s'%(user['id'],client_fp),limit,window):return self.html(shell('Slow down','<section class="card">Too many requests. Try again shortly.</section>',user),429)
@@ -1904,6 +2006,15 @@ class Handler(BaseHTTPRequestHandler):
             with connect() as c:
                 c.execute('INSERT INTO user_settings(user_id,private_account) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET private_account=excluded.private_account',(user['id'],private))
             return self.go('/settings')
+        if path=='/recovery-codes/regenerate':
+            # Update 7: signed-in owner only, CSRF-checked by
+            # authenticated() above. Generates a fresh set of 10 codes
+            # and shows them ONCE, in this response — plaintext is never
+            # stored, logged or emailed, and old codes stop working.
+            with connect() as c:
+                codes=generate_recovery_codes(c,user['id'])
+                audit_event(c,user['id'],'recovery_codes_regenerated','user',user['id'])
+            return self.settings(user,show_codes=codes)
         if path=='/block':
             try: target=int(data.get('user_id',''))
             except ValueError: return self.go('/settings')
