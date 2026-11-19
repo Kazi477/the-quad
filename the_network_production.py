@@ -100,7 +100,15 @@ def init_db():
     with connect() as c:
         # Set WAL once during startup. Repeating this on every request can
         # cause needless locking and delays on a mobile SQLite database.
-        c.execute('PRAGMA journal_mode=WAL')
+        # Update 13: only for plain sqlite3. On a libSQL embedded
+        # replica (Turso mode) the driver manages its own journal;
+        # forcing journal_mode=WAL on a replica is unnecessary and
+        # risks disturbing the replica's WAL state after an unclean
+        # shutdown — the live 502 of 2026-11-19 was a broken replica
+        # WAL, so startup must not poke at the journal mode there.
+        if not (os.environ.get('TURSO_DATABASE_URL') or
+                os.environ.get('TURSO_AUTH_TOKEN')):
+            c.execute('PRAGMA journal_mode=WAL')
         c.executescript('''
         CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,email TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,is_admin INTEGER NOT NULL DEFAULT 0,joined REAL NOT NULL,last_seen REAL NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS posts(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,body TEXT NOT NULL,created REAL NOT NULL);
@@ -480,20 +488,93 @@ def rate_key(raw):
     return hashlib.sha256((APP_SECRET+'|'+str(raw)).encode('utf-8')).hexdigest()
 
 
-def rate_limit(action, raw_key, limit, window_seconds):
-    """Return True when allowed. Stores only a keyed one-way identifier, never raw IP/email data."""
-    now=time.time();key_hash=rate_key(raw_key)
-    with connect() as c:
-        c.execute('BEGIN IMMEDIATE')
-        row=c.execute('SELECT window_start,request_count FROM rate_limits WHERE action=? AND key_hash=?',(action,key_hash)).fetchone()
-        if not row or now-row['window_start']>=window_seconds:
-            c.execute('INSERT INTO rate_limits(action,key_hash,window_start,request_count,last_seen) VALUES(?,?,?,?,?) ON CONFLICT(action,key_hash) DO UPDATE SET window_start=excluded.window_start,request_count=1,last_seen=excluded.last_seen',(action,key_hash,now,1,now))
+# Update 13 (live 502, 2026-11-19): in-memory fallback for rate
+# limiting. If the database cannot be written to — e.g. the Turso
+# replica's WAL is broken after an unclean Render spin-down and
+# every write fails with "wal_insert_begin failed" — rate limiting
+# must degrade, never take the site down. The counters live in
+# memory only while the DB is unusable (they reset on restart, and
+# they are per-process, so on the single free Render instance they
+# still limit a flood from one client). The DB stays the source of
+# truth whenever it works.
+_RATE_LIMIT_MEMORY = {}
+_RATE_LIMIT_MEMORY_LOCK = threading.Lock()
+_RATE_LIMIT_MEMORY_WARNED_AT = {}
+
+
+def _rate_limit_is_transient(exc):
+    """True for WAL/lock errors worth retrying (and then falling
+    back to memory) rather than treating as a programming error."""
+    msg = str(exc).lower()
+    return any(m in msg for m in
+               ('wal_insert_begin', 'database is locked',
+                'database is busy', 'busy', 'locked', 'wal'))
+
+
+def _rate_limit_memory(action, key_hash, limit, window_seconds, now):
+    """In-memory copy of rate_limit's window/counter logic. Returns
+    True when allowed. Only used when the DB write has failed."""
+    with _RATE_LIMIT_MEMORY_LOCK:
+        entry = _RATE_LIMIT_MEMORY.get((action, key_hash))
+        if not entry or now - entry[0] >= window_seconds:
+            _RATE_LIMIT_MEMORY[(action, key_hash)] = (now, 1)
             return True
-        if row['request_count']>=limit:
-            c.execute('UPDATE rate_limits SET last_seen=? WHERE action=? AND key_hash=?',(now,action,key_hash))
+        window_start, count = entry
+        if count >= limit:
             return False
-        c.execute('UPDATE rate_limits SET request_count=request_count+1,last_seen=? WHERE action=? AND key_hash=?',(now,action,key_hash))
+        _RATE_LIMIT_MEMORY[(action, key_hash)] = (window_start, count + 1)
         return True
+
+
+def rate_limit(action, raw_key, limit, window_seconds):
+    """Return True when allowed. Stores only a keyed one-way identifier, never raw IP/email data.
+
+    Update 13: never raises for a database write failure. The live
+    site 502d on every single page on 2026-11-19 because this ran
+    first on every GET (do_GET calls it for the 'view-log' bucket
+    before rendering anything) and its INSERT failed with
+    ``wal_insert_begin failed`` on the broken Turso replica — the
+    exception escaped do_GET, the handler closed the connection
+    without a response, and Render/nginx answered 502, while
+    /healthz (read-only) stayed green. Now a transient WAL/lock
+    failure is retried briefly, and if the DB still cannot be
+    written to, the check falls back to the in-memory counters
+    above instead of crashing the request. A flood is still
+    limited; a healthy DB is still the source of truth.
+    """
+    now = time.time()
+    key_hash = rate_key(raw_key)
+    last_exc = None
+    for attempt in range(3):
+        try:
+            with connect() as c:
+                c.execute('BEGIN IMMEDIATE')
+                row = c.execute('SELECT window_start,request_count FROM rate_limits WHERE action=? AND key_hash=?', (action, key_hash)).fetchone()
+                if not row or now - row['window_start'] >= window_seconds:
+                    c.execute('INSERT INTO rate_limits(action,key_hash,window_start,request_count,last_seen) VALUES(?,?,?,?,?) ON CONFLICT(action,key_hash) DO UPDATE SET window_start=excluded.window_start,request_count=1,last_seen=excluded.last_seen', (action, key_hash, now, 1, now))
+                    return True
+                if row['request_count'] >= limit:
+                    c.execute('UPDATE rate_limits SET last_seen=? WHERE action=? AND key_hash=?', (now, action, key_hash))
+                    return False
+                c.execute('UPDATE rate_limits SET request_count=request_count+1,last_seen=? WHERE action=? AND key_hash=?', (now, action, key_hash))
+                return True
+        except Exception as exc:
+            last_exc = exc
+            if not _rate_limit_is_transient(exc):
+                raise
+            if attempt < 2:
+                time.sleep(0.05 * (2 ** attempt))
+    # DB still cannot be written to after retries: degrade to the
+    # in-memory counters instead of crashing the request. Warn in
+    # the log at most once a minute per action so a broken replica
+    # does not spam the logs on every page view.
+    last_warn = _RATE_LIMIT_MEMORY_WARNED_AT.get(action, 0)
+    if now - last_warn >= 60:
+        _RATE_LIMIT_MEMORY_WARNED_AT[action] = now
+        print('rate_limit: database write failed (%s: %s); using '
+              'in-memory rate limiting for %r' %
+              (type(last_exc).__name__, last_exc, action))
+    return _rate_limit_memory(action, key_hash, limit, window_seconds, now)
 
 
 def audit_event(c, actor_user_id, action, target_type, target_id=None, metadata=None):
@@ -983,7 +1064,12 @@ class Handler(BaseHTTPRequestHandler):
         now=time.time()
         with connect() as c:
             row=c.execute('SELECT u.*,s.csrf FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires>? AND s.last_seen>?',(token,now,now-SESSION_IDLE_TIMEOUT)).fetchone()
-            if not row:c.execute('DELETE FROM sessions WHERE token=?',(token,))
+            if not row:
+                # Update 13: expiring a dead session is housekeeping.
+                # If the replica WAL is broken, a failed DELETE must
+                # not 502 the page — the visitor is simply signed out.
+                try:c.execute('DELETE FROM sessions WHERE token=?',(token,))
+                except Exception as exc:print('session cleanup failed:',type(exc).__name__,exc)
         return row,token
     def read_form(self):
         try: length=int(self.headers.get('Content-Length','0'))
@@ -1007,8 +1093,14 @@ class Handler(BaseHTTPRequestHandler):
         proto=self.headers.get('X-Forwarded-Proto','').split(',',1)[0].strip().lower()
         return 'Secure; ' if (PRODUCTION or proto=='https') else ''
     def touch(self,user,token):
-        now=time.time()
-        with connect() as c:c.execute('UPDATE users SET last_seen=? WHERE id=?',(now,user['id']));c.execute('UPDATE sessions SET last_seen=? WHERE token=?',(now,token))
+        # Update 13: last_seen is bookkeeping, never worth crashing
+        # a request over. If the replica WAL is broken, the /activity
+        # ping still answers 204.
+        try:
+            now=time.time()
+            with connect() as c:c.execute('UPDATE users SET last_seen=? WHERE id=?',(now,user['id']));c.execute('UPDATE sessions SET last_seen=? WHERE token=?',(now,token))
+        except Exception as exc:
+            print('touch: last_seen update failed:',type(exc).__name__,exc)
     def do_GET(self):
         path=urllib.parse.urlparse(self.path).path
         if path in ('/health','/healthz'):
@@ -1025,14 +1117,26 @@ class Handler(BaseHTTPRequestHandler):
             # Logging itself is throttled (20/min per client) so a flood of GETs
             # cannot fill the database with page_views rows; admin traffic
             # figures are therefore approximate, not exact counts.
-            now=time.time()
-            log_view = rate_limit('view-log', self.client_fingerprint(), 20, 60)
-            with connect() as c:
-                if log_view:
-                    c.execute('INSERT INTO page_views(user_id,path,created) VALUES(?,?,?)',(user['id'] if user else None,path[:120],now))
-                if user:
-                    c.execute('UPDATE users SET last_seen=? WHERE id=?',(now,user['id']))
-                    c.execute('UPDATE sessions SET last_seen=? WHERE token=?',(now,token))
+            # Update 13: page-view logging and last_seen are
+            # bookkeeping — they must never 502 a page. If the
+            # database write fails (the live 502 of 2026-11-19 was
+            # exactly this: rate_limit's INSERT failing with
+            # "wal_insert_begin failed" on a broken Turso replica
+            # WAL), log the failure and render the page anyway.
+            # rate_limit itself already falls back to memory; this
+            # guard covers the page_views INSERT and last_seen
+            # UPDATEs that follow it.
+            try:
+                now=time.time()
+                log_view = rate_limit('view-log', self.client_fingerprint(), 20, 60)
+                with connect() as c:
+                    if log_view:
+                        c.execute('INSERT INTO page_views(user_id,path,created) VALUES(?,?,?)',(user['id'] if user else None,path[:120],now))
+                    if user:
+                        c.execute('UPDATE users SET last_seen=? WHERE id=?',(now,user['id']))
+                        c.execute('UPDATE sessions SET last_seen=? WHERE token=?',(now,token))
+            except Exception as exc:
+                print('page-view logging failed:',type(exc).__name__,exc)
         if user and user['must_change_password'] and path not in ('/change-password','/logout','/app.js','/app.css','/activity.js','/favicon.ico','/health','/healthz'):
             return self.html(change_password_page(user, forced=True))
         if path == '/app.css':

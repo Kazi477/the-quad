@@ -62,10 +62,48 @@ lost when the instance restarts. See RENDER_FREE.md.
 import os
 import shutil
 import sqlite3
+import threading
+from pathlib import Path
 
 # ---------------------------------------------------------------- env
 TURSO_DATABASE_URL = os.environ.get('TURSO_DATABASE_URL', '').strip()
 TURSO_AUTH_TOKEN = os.environ.get('TURSO_AUTH_TOKEN', '').strip()
+
+# Markers for the WAL/write errors the live site hit (see connect_turso).
+_WAL_ERROR_MARKERS = ('wal_insert_begin', 'database is locked',
+                      'database is busy', 'wal', 'busy', 'locked',
+                      'cannot start a transaction within a transaction')
+# The WAL self-check (below) runs once per process, guarded by this
+# lock so concurrent first requests cannot run recovery twice.
+_WAL_PROBE_LOCK = threading.Lock()
+_WAL_PROBE_DONE = False
+
+
+def _is_wal_error(exc):
+    """True for the WAL/lock errors that mean 'the replica cannot
+    write right now' (as opposed to a real SQL/programming error)."""
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _WAL_ERROR_MARKERS)
+
+
+def _remove_stale_wal_files(db_path):
+    """Delete a replica's -wal/-shm sidecar files.
+
+    Safe: the -wal only holds frames not yet checkpointed into the
+    main file, and on a Turso replica the cloud primary is the source
+    of truth — a checkpointed main file plus a re-sync recovers the
+    data. Only ever called after a WAL error, never on a healthy DB.
+    """
+    removed = []
+    for suffix in ('-wal', '-shm'):
+        try:
+            p = Path(str(db_path) + suffix)
+            if p.exists():
+                p.unlink()
+                removed.append(suffix)
+        except OSError:
+            pass
+    return removed
 
 
 def turso_enabled():
@@ -251,6 +289,50 @@ class _Connection:
 
 
 # ------------------------------------------------------------ entry points
+def _open_raw(db_path, sync_url=None, auth_token=''):
+    """One libsql.connect call. Kept separate so the recovery path
+    in connect_turso can re-open the replica cleanly."""
+    import libsql_experimental as libsql
+    kwargs = {}
+    if sync_url:
+        kwargs['sync_url'] = sync_url
+        kwargs['auth_token'] = auth_token or ''
+        kwargs['sync_interval'] = 60
+    return libsql.connect(str(db_path), **kwargs)
+
+
+def _apply_pragmas(conn):
+    conn.execute('PRAGMA foreign_keys=ON')
+    conn.execute('PRAGMA busy_timeout=30000')
+    conn.execute('PRAGMA synchronous=NORMAL')
+
+
+def _wal_self_check(conn):
+    """Once per process: prove this replica can actually write to its
+    WAL before the server starts serving pages.
+
+    Why: on Render free the process is killed when the instance
+    spins down, and /tmp can keep the replica's -wal/-shm files.
+    A WAL left half-written by that unclean shutdown replays fine
+    for reads (so /healthz, which only does SELECT 1, stays green)
+    but every real write then fails with
+    ``sqlite3.Error: wal_insert_begin failed`` — which is exactly
+    what took the live homepage down on 2026-11-19: every GET /
+    writes through rate_limit() first, so one broken WAL 502s the
+    whole site while the health check looks healthy. A checkpoint
+    forces the WAL to be exercised; if it raises a WAL/lock error
+    the replica is broken and the caller must run recovery.
+    Non-WAL errors (e.g. the driver not supporting checkpoints)
+    are logged and ignored — the check must never break a healthy DB.
+    """
+    try:
+        conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    except Exception as exc:
+        if _is_wal_error(exc):
+            raise
+        print('wal_checkpoint skipped:', type(exc).__name__, exc)
+
+
 def connect_turso(db_path, sync_url=None, auth_token=''):
     """Open the database as a libSQL embedded replica (or local file).
 
@@ -260,32 +342,116 @@ def connect_turso(db_path, sync_url=None, auth_token=''):
     tests). With a sync URL, libsql syncs the replica from the cloud
     primary on open; if that sync fails, it raises instead of
     silently running local-only.
+
+    WAL recovery (Update 13): if the replica's WAL is broken after
+    an unclean shutdown — the live 502 of 2026-11-19 — opening is
+    retried after removing the stale -wal/-shm sidecars, and, only
+    when there is a real ``libsql://`` sync URL to rebuild from,
+    after deleting the local file itself so it re-syncs fresh from
+    Turso (the cloud primary is the source of truth). The local
+    file is NEVER deleted when there is no sync URL: in dev/local
+    mode it is the only copy of the data.
     """
     try:
-        import libsql_experimental as libsql
+        import libsql_experimental as libsql  # noqa: F401
     except ImportError as exc:
         raise RuntimeError(
             'Turso mode needs the libsql driver: '
             'pip install libsql-experimental') from exc
-    kwargs = {}
-    if sync_url:
-        kwargs['sync_url'] = sync_url
-        kwargs['auth_token'] = auth_token or ''
-        kwargs['sync_interval'] = 60
     try:
-        raw = libsql.connect(str(db_path), **kwargs)
+        raw = _open_raw(db_path, sync_url=sync_url, auth_token=auth_token)
+    except Exception as exc:
+        if not _is_wal_error(exc):
+            raise sqlite3.Error(
+                'Could not open Turso database (sync failed?): %s' % exc) from None
+        # The WAL can be so broken that even opening the replica
+        # fails (e.g. a garbage -wal left by an unclean shutdown).
+        # Drop the sidecars and try once more before giving up.
+        print('Turso replica failed to open (%s); removing stale '
+              '-wal/-shm and retrying...' % exc)
+        _remove_stale_wal_files(db_path)
+        try:
+            raw = _open_raw(db_path, sync_url=sync_url,
+                            auth_token=auth_token)
+        except Exception as exc2:
+            raise sqlite3.Error(
+                'Could not open Turso database (sync failed?): %s'
+                % exc2) from None
+    conn = _Connection(raw, db_path, sync_url=sync_url,
+                       auth_token=auth_token)
+    try:
+        _apply_pragmas(conn)
+    except Exception:
+        conn.close()
+        raise
+    global _WAL_PROBE_DONE
+    if not _WAL_PROBE_DONE:
+        with _WAL_PROBE_LOCK:
+            if not _WAL_PROBE_DONE:
+                conn = _wal_probe_or_recover(conn, db_path, sync_url,
+                                             auth_token)
+                _WAL_PROBE_DONE = True
+    return conn
+
+
+def _wal_probe_or_recover(conn, db_path, sync_url, auth_token):
+    """Run the once-per-process WAL self-check, healing the replica
+    if it fails. Returns a usable connection (possibly a fresh one)
+    or raises sqlite3.Error if the replica cannot be healed."""
+    try:
+        _wal_self_check(conn)
+        return conn
+    except Exception as exc:
+        if not _is_wal_error(exc):
+            raise
+        wal_exc = exc
+    print('Turso replica WAL looks stale (%s); removing -wal/-shm '
+          'and retrying...' % wal_exc)
+    conn.close()
+    _remove_stale_wal_files(db_path)
+    try:
+        raw = _open_raw(db_path, sync_url=sync_url, auth_token=auth_token)
     except Exception as exc:
         raise sqlite3.Error(
             'Could not open Turso database (sync failed?): %s' % exc) from None
     conn = _Connection(raw, db_path, sync_url=sync_url,
                        auth_token=auth_token)
     try:
-        conn.execute('PRAGMA foreign_keys=ON')
-        conn.execute('PRAGMA busy_timeout=10000')
-        conn.execute('PRAGMA synchronous=NORMAL')
-    except Exception:
+        _apply_pragmas(conn)
+        _wal_self_check(conn)
+        print('Turso replica WAL recovered after removing stale sidecars.')
+        return conn
+    except Exception as exc:
+        if not _is_wal_error(exc):
+            conn.close()
+            raise
+        wal_exc = exc
+    # Still broken, and the local file itself must be corrupt. Only
+    # rebuild it when Turso can supply the data again — never in
+    # local/dev mode, where the file is the only copy.
+    if not (sync_url and sync_url.startswith('libsql://')):
         conn.close()
-        raise
+        raise sqlite3.Error(
+            'Turso replica WAL is unusable and there is no cloud '
+            'database to rebuild it from: %s' % wal_exc) from None
+    print('Turso replica still unusable; rebuilding the local file '
+          'from Turso (cloud copy is the source of truth)...')
+    conn.close()
+    for suffix in ('', '-wal', '-shm'):
+        try:
+            Path(str(db_path) + suffix).unlink(missing_ok=True)
+        except OSError:
+            pass
+    try:
+        raw = _open_raw(db_path, sync_url=sync_url, auth_token=auth_token)
+    except Exception as exc:
+        raise sqlite3.Error(
+            'Could not open Turso database (sync failed?): %s' % exc) from None
+    conn = _Connection(raw, db_path, sync_url=sync_url,
+                       auth_token=auth_token)
+    _apply_pragmas(conn)
+    _wal_self_check(conn)
+    print('Turso replica rebuilt from Turso; WAL is writable again.')
     return conn
 
 

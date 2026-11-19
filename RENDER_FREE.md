@@ -116,6 +116,19 @@ sync), so a wiped Render disk just re-syncs from Turso on startup.
   throttled to 20/min/client; sessions/last_seen update on
   requests). For a small friends site this is fine; if it ever
   gets busy, the write counter is the first thing to watch.
+* **Live 502 — FIXED in Update 13 (dev only, 2026-11-19, not
+  deployed yet).** On launch night every GET / returned 502 while
+  /healthz stayed ok: the replica's WAL was left broken after an
+  unclean spin-down and every write failed with
+  `wal_insert_begin failed`, and do_GET writes (rate_limit) before
+  rendering anything. Fixed in dev: rate_limit retries then falls
+  back to in-memory counters instead of crashing the request,
+  page-view logging can never 502 a page, init_db no longer
+  forces journal_mode=WAL on a replica, and connect_turso runs a
+  once-per-process WAL self-check that removes stale -wal/-shm
+  sidecars (and, only with a real libsql:// URL, rebuilds the
+  local file from Turso). Needs a redeploy after approval; verify
+  GET / still returns 200 after the first sleep/wake.
 * **APP_SECRET must stay stable.** It is generated once by Render
   (`generateValue: true`). If it is ever regenerated, every
   signed-in user is logged out and reset links break.
