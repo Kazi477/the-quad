@@ -87,7 +87,7 @@ def init_db():
         CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);
         ''')
         for col, decl in [('display_name','TEXT'),('bio','TEXT'),('interests','TEXT'),('avatar_key','TEXT'),('recovery_hash','TEXT'),('must_change_password','INTEGER NOT NULL DEFAULT 0')]: add_column(c,'users',col,decl)
-        for col, decl in [('media_key','TEXT'),('media_type','TEXT'),('music_track','TEXT')]: add_column(c,'posts',col,decl)
+        for col, decl in [('media_key','TEXT'),('media_type','TEXT'),('music_track','TEXT'),('spotify_url','TEXT'),('spotify_track_id','TEXT')]: add_column(c,'posts',col,decl)
         c.executescript('''
         CREATE TABLE IF NOT EXISTS uploads(key TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,content_type TEXT NOT NULL,size INTEGER NOT NULL,created REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS likes(post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,created REAL NOT NULL,PRIMARY KEY(post_id,user_id));
@@ -102,6 +102,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS notifications(id TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,actor_id INTEGER REFERENCES users(id) ON DELETE CASCADE,kind TEXT NOT NULL,target_id TEXT,body TEXT NOT NULL,created REAL NOT NULL,read_at REAL);
         CREATE TABLE IF NOT EXISTS page_views(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,path TEXT NOT NULL,created REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS removed_users(id INTEGER PRIMARY KEY AUTOINCREMENT,original_user_id INTEGER NOT NULL,name TEXT NOT NULL,email TEXT NOT NULL,password_hash TEXT NOT NULL,is_admin INTEGER NOT NULL DEFAULT 0,joined REAL NOT NULL,data_json TEXT NOT NULL DEFAULT '{}',backup_file TEXT,removed_at REAL NOT NULL,removed_by INTEGER,restore_deadline REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS listening_notes(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,track_title TEXT NOT NULL,artist TEXT NOT NULL DEFAULT '',spotify_url TEXT,spotify_track_id TEXT,created REAL NOT NULL,expires_at REAL NOT NULL);
+        CREATE INDEX IF NOT EXISTS listening_notes_expires_idx ON listening_notes(expires_at);
         CREATE INDEX IF NOT EXISTS notification_user_idx ON notifications(user_id,created);
         CREATE INDEX IF NOT EXISTS notification_unread_idx ON notifications(user_id,read_at);
         CREATE INDEX IF NOT EXISTS message_pair_idx ON messages(sender_id,recipient_id,created);
@@ -120,6 +122,7 @@ def init_db():
         c.execute('DELETE FROM password_reset_codes WHERE expires<=?',(now,))
         c.execute('DELETE FROM rate_limits WHERE last_seen<?',(now-2*86400,))
         c.execute('DELETE FROM removed_users WHERE restore_deadline<?',(now,))
+        c.execute('DELETE FROM listening_notes WHERE expires_at<=?',(now,))
     import_legacy_database()
     # Keep the named owner account as admin, including accounts imported from
     # the older database. This does not change the account's password.
@@ -304,6 +307,104 @@ MUSIC_TRACKS = {
     'quad-quad': 'Quad Radio · Quad Anthem',
 }
 
+# Spotify Listening Notes (Instagram Notes-style, manual only for now).
+# There is NO Spotify developer app / client credentials in this codebase and
+# no user's Spotify is connected, so there is NO automatic real-time sync.
+# A note is set by hand by its owner; the Spotify link is only a link out
+# to open.spotify.com (plus a no-auth embed player). True live now-playing
+# would need a Spotify developer app + per-user OAuth with the
+# user-read-currently-playing scope — see /notes/refresh and MERGE_NOTES.
+SPOTIFY_TRACK_ID_RE = re.compile(r'^[A-Za-z0-9]{22}$')
+LISTENING_NOTE_TTL = 24 * 3600
+SPOTIFY_LINK_HELP = 'Paste a Spotify track link like https://open.spotify.com/track/AAAAAAAAAAAAAAAAAAAAAA (22 characters after /track/).'
+
+def parse_spotify_link(raw):
+    """Validate a Spotify track link/id. Returns (track_id, canonical_url, error).
+
+    Accepts: a bare 22-char track id, spotify:track:<id>, or an
+    open.spotify.com/track/<id> URL (with optional query/fragment).
+    Anything else — other hosts, other Spotify paths, malformed ids —
+    is rejected. No network call is made; the id is NOT verified to
+    exist on Spotify, only that it is well-formed."""
+    value = (raw or '').strip()
+    if not value:
+        return (None, None, None)
+    if len(value) > 300:
+        return (None, None, 'That Spotify link is too long.')
+    if value.startswith('spotify:track:'):
+        tid = value[len('spotify:track:'):]
+        if SPOTIFY_TRACK_ID_RE.fullmatch(tid):
+            return (tid, 'https://open.spotify.com/track/' + tid, None)
+        return (None, None, 'That Spotify track link is not valid. ' + SPOTIFY_LINK_HELP)
+    if SPOTIFY_TRACK_ID_RE.fullmatch(value):
+        return (value, 'https://open.spotify.com/track/' + value, None)
+    try:
+        parsed = urllib.parse.urlparse(value)
+    except Exception:
+        return (None, None, 'That Spotify track link is not valid. ' + SPOTIFY_LINK_HELP)
+    if parsed.scheme not in ('http', 'https') or parsed.netloc.lower() not in ('open.spotify.com', 'www.open.spotify.com'):
+        return (None, None, 'Only Spotify track links are accepted. ' + SPOTIFY_LINK_HELP)
+    parts = [p for p in parsed.path.split('/') if p]
+    if len(parts) >= 2 and parts[0] == 'track' and SPOTIFY_TRACK_ID_RE.fullmatch(parts[1]):
+        return (parts[1], 'https://open.spotify.com/track/' + parts[1], None)
+    return (None, None, 'That Spotify track link is not valid. ' + SPOTIFY_LINK_HELP)
+
+def active_listening_note(c, user_id, now=None):
+    now = time.time() if now is None else now
+    return c.execute('SELECT * FROM listening_notes WHERE user_id=? AND expires_at>? ORDER BY created DESC LIMIT 1', (user_id, now)).fetchone()
+
+def visible_listening_note(c, viewer_id, owner_id):
+    """A note is visible to its owner, to anyone who can view the owner's
+    posts, and to nobody else. In particular a non-friend cannot see a
+    private user's note, and a blocked user cannot see it either
+    (can_view_post covers both). Expired notes are never visible."""
+    if viewer_id == owner_id:
+        return active_listening_note(c, owner_id)
+    if not can_view_post(c, viewer_id, owner_id):
+        return None
+    return active_listening_note(c, owner_id)
+
+def spotify_embed_html(track_id):
+    if not track_id or not SPOTIFY_TRACK_ID_RE.fullmatch(track_id):
+        return ''
+    return '<iframe class="spotify-embed" src="https://open.spotify.com/embed/track/%s" loading="lazy" title="Spotify player"></iframe>' % esc(track_id)
+
+def spotify_note_html(note, embed=False):
+    """Escaped rendering of one Listening Note. Never auto-plays."""
+    if not note:
+        return ''
+    title = esc(note['track_title'])
+    artist = esc(note['artist']) if note['artist'] else ''
+    by = ' — %s' % artist if artist else ''
+    out = '<div class="spotify-note"><b>♫ %s%s</b>' % (title, by)
+    if note['spotify_track_id']:
+        out += ' · <a href="https://open.spotify.com/track/%s" target="_blank" rel="noopener">Listen on Spotify</a>' % esc(note['spotify_track_id'])
+    out += '<br><small>Set %s · expires after 24 hours</small>' % esc(date(note['created']))
+    if embed and note['spotify_track_id']:
+        out += spotify_embed_html(note['spotify_track_id'])
+    out += '</div>'
+    return out
+
+def listening_note_form(user, note):
+    """Set/change/clear form for the signed-in user's own note."""
+    title = esc(note['track_title']) if note else ''
+    artist = esc(note['artist']) if note else ''
+    link = esc(note['spotify_url']) if note and note['spotify_url'] else ''
+    out = '<section class="card"><h2>Your Listening Note</h2><p class="small">Like an Instagram Note — pick a song to display for 24 hours, anytime. Friends can see it. If your account is private, strangers cannot.</p>'
+    if note:
+        out += spotify_note_html(note, embed=True)
+    out += ('<form method="post" action="/listening-note">%s'
+        '<label>Song title</label><input name="track_title" value="%s" required maxlength="120" placeholder="Song title">'
+        '<label>Artist</label><input name="artist" value="%s" maxlength="120" placeholder="Artist (optional)">'
+        '<label>Spotify track link (optional)</label><input name="spotify_link" value="%s" maxlength="300" placeholder="https://open.spotify.com/track/...">'
+        '<button class="btn">%s</button></form>') % (form_csrf(user), title, artist, link, 'Update my note' if note else 'Set my note')
+    if note:
+        out += ('<form method="post" action="/listening-note" data-confirm="Clear your Listening Note?">%s'
+            '<input type="hidden" name="clear" value="1"><button class="light">Clear my note</button></form>') % form_csrf(user)
+    out += '<p class="small">Live Spotify sync is not set up yet — this note is set by hand. <a href="/notes/refresh">Why live sync needs Spotify to be linked</a></p></section>'
+    return out
+
+
 
 def rate_key(raw):
     return hashlib.sha256((APP_SECRET+'|'+str(raw)).encode('utf-8')).hexdigest()
@@ -365,6 +466,10 @@ def date(ts): return time.strftime('%d %b %Y · %H:%M', time.localtime(ts)) if t
 CSS = '''
 :root{color-scheme:light dark;--ink:#0f1f1e;--muted:#5b6b6a;--brand:#0d9488;--brand-dark:#0f766e;--accent:#14b8a6;--line:#dfe8e7;--surface:#ffffff;--soft:#f0f7f6;--shadow:0 12px 32px #0f766e14}
 *{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#f2faf9 0,#eef4f3 280px);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}header{position:sticky;top:0;background:#ffffffe6;backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border-bottom:1px solid var(--line);padding:11px max(calc((100% - 1160px)/2),18px);display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;z-index:5}.brand{font-size:23px;font-weight:800;letter-spacing:-.8px;color:var(--ink);text-decoration:none}.quad-pill{display:inline-block;vertical-align:middle;font-size:11px;font-weight:800;letter-spacing:1.2px;text-transform:uppercase;color:#fff;background:var(--brand);border-radius:999px;padding:4px 10px;margin-left:6px}nav{display:flex;align-items:center;gap:4px;flex-wrap:wrap}nav a{padding:8px 14px;border-radius:999px;font-weight:650;font-size:13px;color:#3b4a49;text-decoration:none}nav a:hover{background:var(--soft);color:var(--brand-dark);text-decoration:none}nav form{display:inline}nav form button{border-radius:999px}a{color:var(--brand);text-decoration:none}a:hover{text-decoration:underline}main{max-width:1160px;margin:26px auto;padding:0 18px}.layout{display:grid;grid-template-columns:170px minmax(0,1fr) 258px;gap:20px;align-items:start}.side,.rail{position:sticky;top:78px}.side a{display:block;padding:10px 14px;border-radius:999px;font-weight:650;color:#48566f;text-decoration:none}.side a:hover{background:#e6f4f2;color:var(--brand-dark);text-decoration:none}.card{background:var(--surface);border:1px solid var(--line);border-radius:20px;padding:20px;margin:14px 0;box-shadow:var(--shadow)}h1{font-size:30px;line-height:1.18;letter-spacing:-.7px;margin:8px 0 18px}h2{font-size:19px;letter-spacing:-.25px;margin:4px 0 12px}h3{font-size:15px;margin:8px 0}.eyebrow{font-size:11px;letter-spacing:1.4px;color:var(--brand);font-weight:800;text-transform:uppercase}p{color:var(--muted)}.avatar{display:inline-flex;vertical-align:middle;object-fit:cover;align-items:center;justify-content:center;flex:none;border-radius:50%;background:#d9f2ef;color:var(--brand-dark);font-weight:750;font-size:18px}.row{display:flex;align-items:center;gap:10px}.grow{flex:1}.muted,small,time{font-size:12px;color:var(--muted)}input,textarea,select{width:100%;padding:11px 12px;border:1px solid #d5dce9;border-radius:12px;font:inherit;background:white;color:var(--ink)}input:focus,textarea:focus,select:focus{outline:3px solid #0d948822;border-color:var(--brand)}input[type=checkbox],input[type=file]{width:auto}textarea{min-height:82px;resize:vertical}label{display:block;font-size:13px;font-weight:650;margin:12px 0 6px}button,.btn{display:inline-flex;align-items:center;justify-content:center;background:var(--brand);border:0;border-radius:999px;color:white;padding:10px 16px;font:inherit;font-weight:700;cursor:pointer;transition:background .15s,transform .15s;text-decoration:none}button:hover,.btn:hover{background:var(--brand-dark);text-decoration:none;transform:translateY(-1px)}button:disabled{opacity:.6;cursor:wait;transform:none}.btn{margin-top:10px}.light{background:#edf1f8;color:#34435d}.light:hover{background:#e1e8f5;color:#203254}.danger{background:#a83c49;padding:7px 12px;font-size:13px}.inline{display:inline}.post{white-space:pre-wrap;overflow-wrap:anywhere;margin:15px 0;color:#27344a}.post img.media,.post video.media{display:block;width:100%;max-height:560px;object-fit:contain;background:#f2f4f7;border-radius:14px;margin-top:10px}.post time{display:block}.actions{display:flex;gap:8px;border-top:1px solid var(--line);padding-top:10px}.actions button{flex:1;background:transparent;color:#596a81}.actions button:hover,.actions .liked{background:#e6f4f2;color:var(--brand-dark)}.notice{background:#fff9e8;border-color:#f3e6bd;padding:13px 16px;border-radius:14px}.unread{background:#eaf7f5}.person{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid #edf0f4}.person:last-child{border:0}.person p{margin:2px 0}.small{font-size:13px}.rail h2{font-size:16px;margin:2px 0 8px}.friend-row{display:flex;align-items:center;gap:8px;padding:6px 0}.friend-post{border-top:1px solid #edf0f4;padding:9px 0}.friend-post a{font-weight:bold}.friend-post p{margin:3px 0;overflow-wrap:anywhere}.rail .all-link{display:block;text-align:center;padding:9px;border-radius:999px;background:var(--soft);font-weight:700;font-size:13px}.message-list{height:360px;overflow:auto;display:flex;flex-direction:column;gap:8px;border-bottom:1px solid var(--line);padding:10px}.bubble{align-self:flex-start;background:#edf1f7;border-radius:14px;padding:9px 12px;max-width:85%;white-space:pre-wrap;overflow-wrap:anywhere}.bubble.mine{align-self:flex-end;background:var(--brand);color:#fff}.bubble time{display:block;color:inherit;opacity:.7}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.center{text-align:center}.file-row{font-size:13px;background:var(--soft);padding:8px;border-radius:8px}.error{background:#fff0f0;color:#8e2323;padding:12px;border-radius:10px}.footer{border-top:1px solid var(--line);color:#77849a;font-size:12px;padding:20px 4px;margin-top:30px}.badge{display:inline-flex;align-items:center;justify-content:center;min-width:19px;height:19px;padding:0 5px;margin-left:3px;border-radius:20px;background:#ccf2ee;color:var(--brand-dark);font-size:11px;font-weight:800}.comment{padding:10px 12px;background:#f6f8fc;border-radius:12px;margin:8px 0}.comment p{margin:3px 0;color:#29364c;white-space:pre-wrap;overflow-wrap:anywhere}.comment-form{display:flex;gap:8px;align-items:flex-end}.comment-form textarea{min-height:44px}.comment-form button{flex:none}.metric-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:15px 0}.metric{padding:15px;border:1px solid var(--line);border-radius:14px;background:linear-gradient(145deg,#fff,#f0f8f7)}.metric b{display:block;font-size:25px;letter-spacing:-.5px}.metric span{font-size:12px;color:var(--muted)}.traffic-chart{height:190px;display:flex;align-items:stretch;gap:5px;padding:12px 4px 0;border-bottom:1px solid var(--line)}.traffic-bar{flex:1;display:flex;min-width:0;flex-direction:column;justify-content:flex-end;align-items:center;gap:5px}.traffic-bar i{display:block;width:100%;min-height:3px;background:linear-gradient(180deg,#2dd4bf,var(--brand));border-radius:5px 5px 2px 2px}.traffic-bar small{font-size:9px}.scroll-panel{max-height:420px;overflow:auto}.table-row{display:flex;justify-content:space-between;gap:12px;padding:9px 2px;border-bottom:1px solid #edf0f4}.table-row:last-child{border:0}.quad-hero{background:linear-gradient(135deg,#0f766e,#14b8a6);color:#fff;border:0}.quad-hero h2{color:#fff;font-size:24px;margin:6px 0}.quad-hero p{color:#d7f5f1}.quad-hero .eyebrow{color:#a7f3d0}.story-row{display:flex;gap:12px;overflow-x:auto;padding:6px 2px 10px}.story{flex:0 0 auto;width:92px;text-align:center;text-decoration:none;color:inherit}.story .avatar{border:3px solid #fff;box-shadow:0 4px 14px #0f766e33;border-radius:16px;width:64px!important;height:64px!important}.story span{display:block;font-size:12px;font-weight:700;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.music-bar{display:flex;align-items:center;gap:10px;background:#f0f7f6;border:1px solid var(--line);border-radius:999px;padding:8px 12px;margin-top:10px}.music-bar button{flex:none;padding:7px 12px;font-size:13px}.shield{background:#f0fdfa;border:1px solid #99f6e4;border-radius:14px;padding:14px;margin:12px 0}
+.note-bubble{display:block;font-size:11px;font-weight:700;background:#dcfce7;color:#14532d;border-radius:999px;padding:4px 8px;margin-bottom:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.spotify-note{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:14px;padding:12px;margin:10px 0}
+.spotify-embed{width:100%;height:80px;border:0;border-radius:12px;margin-top:8px}
+.now-listening{margin-top:6px}
 .auth-wrap{display:grid;grid-template-columns:1.05fr .95fr;gap:22px;align-items:stretch;margin-top:8px}.auth-hero{background:linear-gradient(135deg,#0f766e,#14b8a6);color:#fff;border:0;padding:30px;display:flex;flex-direction:column;justify-content:center}.auth-hero h1{color:#fff;font-size:34px;margin:10px 0 12px}.auth-hero p{color:#d7f5f1}.auth-hero ul{list-style:none;margin:18px 0 0;padding:0;display:grid;gap:10px}.auth-hero li{font-weight:650;color:#fff}.auth-hero li span{color:#a7f3d0;margin-right:8px}.auth-card{padding:28px}.auth-card h2{font-size:24px}.auth-switch{text-align:center;margin:16px 0 0}.auth-switch a{font-weight:700}.password-wrap{position:relative}.password-wrap input{padding-right:64px}.password-toggle{position:absolute;right:6px;top:7px;background:transparent;color:var(--brand-dark);padding:6px 10px;font-size:12px;border-radius:999px}.password-toggle:hover{background:var(--soft);transform:none}.pw-meter{height:8px;background:#e5e7eb;border-radius:999px;overflow:hidden;margin-top:8px}.pw-meter i{display:block;height:100%;width:0;background:var(--brand);transition:width .2s}.pw-hint{font-size:12px;color:var(--muted);margin-top:6px}.auth-note{margin-top:14px}.brand-dot{color:var(--brand)}.rail-h2{margin-top:18px}.shield-h2{margin-top:14px}.confirm-email{width:220px;max-width:100%}.av30{width:30px;height:30px;font-size:13px}.av32{width:32px;height:32px;font-size:14px}.av34{width:34px;height:34px;font-size:14px}.av42{width:42px;height:42px;font-size:18px}.av54{width:54px;height:54px;font-size:20px}.av64{width:64px;height:64px;font-size:22px}.av80{width:80px;height:80px;font-size:26px}.av90{width:90px;height:90px;font-size:28px}.tb3{height:3%}.tb5{height:5%}.tb10{height:10%}.tb15{height:15%}.tb20{height:20%}.tb25{height:25%}.tb30{height:30%}.tb35{height:35%}.tb40{height:40%}.tb45{height:45%}.tb50{height:50%}.tb55{height:55%}.tb60{height:60%}.tb65{height:65%}.tb70{height:70%}.tb75{height:75%}.tb80{height:80%}.tb85{height:85%}.tb90{height:90%}.tb95{height:95%}.tb100{height:100%}
 @media(max-width:400px){header{padding:8px 10px}.brand{font-size:19px}nav a{font-size:11px;padding:5px 7px}main{padding:0 8px}.card{padding:12px;border-radius:14px}h1{font-size:22px}.auth-hero{padding:16px}.auth-hero h1{font-size:22px}.auth-card{padding:16px}.metric-grid{grid-template-columns:1fr}.metric b{font-size:19px}.traffic-chart{height:120px}.traffic-bar small{display:none}.story{width:64px}.story .avatar{width:48px!important;height:48px!important}.message-list{height:300px}.comment-form{flex-wrap:wrap}.table-row{flex-direction:column;align-items:flex-start;gap:6px}.confirm-email{width:100%}.music-bar{padding:6px 10px}.music-bar button{padding:6px 10px;font-size:12px}}
 @media(max-width:1000px){.layout{grid-template-columns:135px minmax(0,1fr)}.rail{position:static;grid-column:2}}@media(max-width:650px){header{position:relative;padding:10px 12px}.brand{font-size:21px}nav{gap:1px}nav a{font-size:12px;padding:6px 9px}main{margin:14px auto;padding:0 10px}.layout{display:block}.side{position:static;display:flex;overflow:auto;gap:4px;margin-bottom:10px}.side a{white-space:nowrap;font-size:13px;padding:8px 12px}.card{padding:14px;border-radius:16px}.grid{grid-template-columns:1fr}h1{font-size:25px}.person{flex-wrap:wrap}.person form{margin-left:4px}.comment-form{align-items:stretch}.comment-form button{padding:8px}.metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.metric b{font-size:21px}.traffic-chart{gap:2px;height:150px}.traffic-bar small{font-size:8px}.auth-wrap{grid-template-columns:1fr}.auth-hero{padding:20px}.auth-hero h1{font-size:26px}.auth-card{padding:20px}.table-row{flex-wrap:wrap}.table-row span{overflow-wrap:anywhere}.music-bar{flex-wrap:wrap;border-radius:16px}.story{width:76px}.story .avatar{width:56px!important;height:56px!important}}}
@@ -550,7 +655,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Permissions-Policy','camera=(), microphone=(), geolocation=(), payment=()')
         self.send_header('Cross-Origin-Opener-Policy','same-origin')
         self.send_header('Cross-Origin-Resource-Policy','same-origin')
-        self.send_header('Content-Security-Policy',"default-src 'self'; base-uri 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; media-src 'self'; frame-ancestors 'none'; form-action 'self'")
+        self.send_header('Content-Security-Policy',"default-src 'self'; base-uri 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; media-src 'self'; frame-src https://open.spotify.com; frame-ancestors 'none'; form-action 'self'")
         if PRODUCTION:self.send_header('Strict-Transport-Security','max-age=31536000; includeSubDomains')
     def html(self, text, status=200, cookie=None):
         body=text.encode('utf-8');self.send_response(status);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Content-Length',str(len(body)));self.security_headers()
@@ -681,6 +786,7 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:page=0
             return self.feed(user,query.get('sort',['newest'])[0],page)
         if path=='/profile':return self.profile(user)
+        if path=='/notes/refresh':return self.listening_refresh(user)
         if path=='/people':return self.people(user,urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('q',[''])[0])
         if path=='/friends':return self.friends(user)
         if path=='/settings':return self.settings(user)
@@ -721,10 +827,16 @@ class Handler(BaseHTTPRequestHandler):
             friend_posts=c.execute("SELECT p.id,p.user_id,p.body,p.created,p.media_key,p.media_type,u.name,u.display_name,u.avatar_key FROM posts p JOIN users u ON u.id=p.user_id WHERE p.user_id IN (SELECT CASE WHEN f.requester_id=? THEN f.addressee_id ELSE f.requester_id END FROM friendships f WHERE (f.requester_id=? OR f.addressee_id=?) AND f.status='accepted') AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.blocker_id=? AND b.blocked_id=p.user_id) OR (b.blocker_id=p.user_id AND b.blocked_id=?)) ORDER BY p.created DESC,p.id DESC LIMIT 4",(user['id'],user['id'],user['id'],user['id'],user['id'])).fetchall()
             incoming=c.execute("SELECT f.requester_id AS user_id,u.* FROM friendships f JOIN users u ON u.id=f.requester_id WHERE f.addressee_id=? AND f.status='pending' ORDER BY f.created DESC",(user['id'],)).fetchall()
             stories=c.execute("SELECT u.*,MAX(p.created) mc FROM users u JOIN posts p ON p.user_id=u.id WHERE u.id=? OR u.id IN (SELECT CASE WHEN f.requester_id=? THEN f.addressee_id ELSE f.requester_id END FROM friendships f WHERE (f.requester_id=? OR f.addressee_id=?) AND f.status='accepted') GROUP BY u.id ORDER BY mc DESC LIMIT 8",(user['id'],user['id'],user['id'],user['id'])).fetchall()
+            note_rows=c.execute("SELECT * FROM listening_notes WHERE expires_at>? AND (user_id=? OR user_id IN (SELECT CASE WHEN f.requester_id=? THEN f.addressee_id ELSE f.requester_id END FROM friendships f WHERE (f.requester_id=? OR f.addressee_id=?) AND f.status='accepted'))",(time.time(),user['id'],user['id'],user['id'],user['id'])).fetchall()
+            notes_by_user={r['user_id']:r for r in note_rows}
+            own_note=notes_by_user.get(user['id'])
         content='<section class="card quad-hero"><span class="eyebrow">The Quad</span><h2>Started in a dorm room. Now it\'s the whole quad.</h2><p>Your people, your posts, your music — all in one place on The Quad.</p></section><h1>Welcome, %s</h1>'%esc(display(user))
         if stories:
             content+='<section class="card"><h2>Quad moments</h2><div class="story-row">'
-            for s in stories:content+='<a class="story" href="/member/%s">%s<span>%s</span></a>'%(s['id'],avatar(s,64),esc(display(s)))
+            for s in stories:
+                snote=notes_by_user.get(s['id'])
+                bubble='<span class="note-bubble">♫ %s</span>' % esc(snote['track_title']) if snote else ''
+                content+='<a class="story" href="/member/%s">%s%s<span>%s</span></a>'%(s['id'],bubble,avatar(s,64),esc(display(s)))
             content+='</div></section>'
         else:
             content+='<section class="card"><h2>Quad moments</h2><p class="small">No moments yet — share the first post and it will show here.</p></section>'
@@ -733,7 +845,8 @@ class Handler(BaseHTTPRequestHandler):
             for m in incoming:
                 content+='<div class="person">%s<b class="grow">%s</b><form method="post" action="/friend">%s<input type="hidden" name="user_id" value="%s"><input type="hidden" name="action" value="accept"><button>Accept</button></form><form method="post" action="/friend">%s<input type="hidden" name="user_id" value="%s"><input type="hidden" name="action" value="decline"><button class="light">Decline</button></form></div>'%(avatar(m),esc(display(m)),form_csrf(user),m['user_id'],form_csrf(user),m['user_id'])
             content+='</section>'
-        content+='<section class="card"><h2>Share a post</h2><form method="post" action="/posts" enctype="multipart/form-data" data-video-form="1">%s<textarea name="body" maxlength="2000" placeholder="What’s on your mind?"></textarea><label>Add a photo or video (videos up to 30 seconds)</label><input type="file" name="media" accept="image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm"><label>Attach Quad Radio music (optional) — built-in synth loops, not real songs</label><select name="music_track"><option value="">No music</option><option value="quad-dawn">Quad Radio · Dawn Loop</option><option value="quad-night">Quad Radio · Night Loop</option><option value="quad-quad">Quad Radio · Quad Anthem</option></select><div class="music-bar"><span class="small grow">Preview Quad Radio:</span><button type="button" data-quad-track="quad-dawn">▶ Dawn</button><button type="button" data-quad-track="quad-night">▶ Night</button><button type="button" data-quad-track="quad-quad">▶ Anthem</button></div><input type="hidden" name="duration_ms" value=""><button class="btn">Share post</button></form></section><div class="row"><h2 class="grow">Your feed</h2><form method="get"><select name="sort"><option value="newest" %s>Newest</option><option value="oldest" %s>Oldest</option><option value="liked" %s>Most nodded</option></select><button class="light">Sort</button></form></div>'%(form_csrf(user),'selected' if sort=='newest' else '','selected' if sort=='oldest' else '','selected' if sort=='liked' else '')
+        content+=listening_note_form(user, own_note)
+        content+='<section class="card"><h2>Share a post</h2><form method="post" action="/posts" enctype="multipart/form-data" data-video-form="1">%s<textarea name="body" maxlength="2000" placeholder="What’s on your mind?"></textarea><label>Add a photo or video (videos up to 30 seconds)</label><input type="file" name="media" accept="image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm"><label>Attach Quad Radio music (optional) — built-in synth loops, not real songs</label><select name="music_track"><option value="">No music</option><option value="quad-dawn">Quad Radio · Dawn Loop</option><option value="quad-night">Quad Radio · Night Loop</option><option value="quad-quad">Quad Radio · Quad Anthem</option></select><label>Attach a Spotify track (optional) — paste a Spotify track link to show a link and preview player on your post</label><input name="spotify_link" maxlength="300" placeholder="https://open.spotify.com/track/..."><div class="music-bar"><span class="small grow">Preview Quad Radio:</span><button type="button" data-quad-track="quad-dawn">▶ Dawn</button><button type="button" data-quad-track="quad-night">▶ Night</button><button type="button" data-quad-track="quad-quad">▶ Anthem</button></div><input type="hidden" name="duration_ms" value=""><button class="btn">Share post</button></form></section><div class="row"><h2 class="grow">Your feed</h2><form method="get"><select name="sort"><option value="newest" %s>Newest</option><option value="oldest" %s>Oldest</option><option value="liked" %s>Most nodded</option></select><button class="light">Sort</button></form></div>'%(form_csrf(user),'selected' if sort=='newest' else '','selected' if sort=='oldest' else '','selected' if sort=='liked' else '')
         if not posts and page==0: content+='<section class="card">No posts yet. Find people or write the first post.</section>'
         for p in posts:
             content+='<article class="card"><div class="row">%s<div class="grow"><a href="/member/%s"><b>%s</b></a><time>%s</time></div>'%(avatar(p),p['user_id'],esc(display(p)),esc(date(p['created'])))
@@ -745,6 +858,7 @@ class Handler(BaseHTTPRequestHandler):
                 if tag=='video':content+='<video class="media" controls playsinline preload="none" src="/media/%s"></video>'%urllib.parse.quote(p['media_key'])
                 else:content+='<img class="media" loading="lazy" decoding="async" src="/media/%s" alt="Post photo">'%urllib.parse.quote(p['media_key'])
             if p['music_track'] and p['music_track'] in MUSIC_TRACKS:content+='<div class="music-bar"><button type="button" data-quad-track="%s">▶ Play</button><span class="small grow">%s · built-in loop</span></div>'%(esc(p['music_track']),esc(MUSIC_TRACKS[p['music_track']]))
+            if p['spotify_track_id']:content+='<div class="spotify-note"><a href="https://open.spotify.com/track/%s" target="_blank" rel="noopener">♫ Listen on Spotify</a>%s</div>'%(esc(p['spotify_track_id']),spotify_embed_html(p['spotify_track_id']))
             content+='<p class="muted">%s %s · <a href="/post/%s">%s comments</a></p><div class="actions"><form method="post" action="/like">%s<input type="hidden" name="post_id" value="%s"><input type="hidden" name="action" value="%s"><button class="%s">%s %s</button></form><a class="btn light" href="/post/%s">Comment</a></div></article>'%(p['likes'],'nod(s)',p['id'],p['comments'],form_csrf(user),p['id'],'unlike' if p['liked'] else 'like','liked' if p['liked'] else '', '♥' if p['liked'] else '♡','Nodded' if p['liked'] else 'Nod',p['id'])
         if page or has_more:
             content+='<div class="row">'
@@ -763,11 +877,23 @@ class Handler(BaseHTTPRequestHandler):
                 if len(preview)>105:preview=preview[:102].rstrip()+'…'
                 friends_panel+='<div class="friend-post"><div class="row">%s<a href="/member/%s">%s</a></div><p class="small">%s · %s</p></div>'%(avatar(fp,30),fp['user_id'],esc(display(fp)),esc(preview),esc(date(fp['created'])))
         else:friends_panel+='<p class="small">Your friends’ new posts will show here.</p>'
+        friends_panel+='<h2 class="rail-h2">Now listening</h2><div class="now-listening">'
+        friend_notes=[notes_by_user[f['id']] for f in friends if f['id'] in notes_by_user]
+        if friend_notes:
+            for n in friend_notes:
+                owner_row=next((f for f in friends if f['id']==n['user_id']), None)
+                friends_panel+='<div class="friend-post"><div class="row">%s<a href="/member/%s">%s</a></div>%s</div>'%(avatar(owner_row,30) if owner_row else '',n['user_id'],esc(display(owner_row)) if owner_row else 'Friend',spotify_note_html(n, embed=False))
+        else:
+            friends_panel+='<p class="small">No friends are sharing a Listening Note right now. Set yours from the feed — it lasts 24 hours.</p>'
+        friends_panel+='</div>'
         layout='<div class="layout"><aside class="side"><a href="/">⌂ Feed</a><a href="/people">♧ People</a><a href="/friends">♧ Friends</a><a href="/messages">✉ Messages</a><a href="/notifications">♢ Notifications</a><a href="/profile">◉ Profile</a></aside><section>%s</section>%s</div>'%(content,friends_panel+'</aside>')
         return self.html(shell('Feed',layout,user))
     def profile(self,user):
-        with connect() as c:u=user_by_id(c,user['id'])
+        with connect() as c:
+            u=user_by_id(c,user['id'])
+            my_note=active_listening_note(c,user['id'])
         content='<section class="card"><h1>Your profile</h1><div class="row">%s <b>%s</b></div><form method="post" action="/profile" enctype="multipart/form-data">%s<label>Display name</label><input name="display_name" value="%s" required maxlength="60"><label>Bio</label><textarea name="bio" maxlength="240">%s</textarea><label>Interests</label><input name="interests" value="%s" maxlength="240" placeholder="Music, hiking, cooking"><label>Profile photo (JPEG, PNG, GIF or WebP; 8 MB max)</label><input type="file" name="avatar" accept="image/jpeg,image/png,image/gif,image/webp"><button class="btn">Save profile</button></form></section>'%(avatar(u,80),esc(display(u)),form_csrf(user),esc(display(u)),esc(u['bio']),esc(u['interests']))
+        content+=listening_note_form(user, my_note)
         return self.html(shell('Profile',content,user),cookie=None)
     def post_detail(self,user,pid):
         with connect() as c:
@@ -781,6 +907,7 @@ class Handler(BaseHTTPRequestHandler):
             if (p['media_type'] or '').startswith('video/'):content+='<video class="media" controls playsinline src="/media/%s"></video>'%urllib.parse.quote(p['media_key'])
             else:content+='<img class="media" src="/media/%s" alt="Post photo">'%urllib.parse.quote(p['media_key'])
         if p['music_track'] and p['music_track'] in MUSIC_TRACKS:content+='<div class="music-bar"><button type="button" data-quad-track="%s">▶ Play</button><span class="small grow">%s · built-in loop</span></div>'%(esc(p['music_track']),esc(MUSIC_TRACKS[p['music_track']]))
+        if p['spotify_track_id']:content+='<div class="spotify-note"><a href="https://open.spotify.com/track/%s" target="_blank" rel="noopener">♫ Listen on Spotify</a>%s</div>'%(esc(p['spotify_track_id']),spotify_embed_html(p['spotify_track_id']))
         content+='<p class="muted">%s nod(s) · %s comment(s)</p><div class="actions"><form method="post" action="/like">%s<input type="hidden" name="post_id" value="%s"><input type="hidden" name="action" value="%s"><button class="%s">%s %s</button></form></div></article>'%(p['likes'],len(comments),form_csrf(user),pid,'unlike' if p['liked'] else 'like','liked' if p['liked'] else '','♥' if p['liked'] else '♡','Nodded' if p['liked'] else 'Nod')
         content+='<section class="card"><h2>Discussion</h2>'
         for cm in comments:
@@ -859,6 +986,22 @@ class Handler(BaseHTTPRequestHandler):
             dest='/friends' if n['kind'] in ('friend_request','friend_accept') else ('/messages?with=%s'%n['actor_id'] if n['kind']=='message' else ('/post/%s'%esc(n['target_id']) if n['kind'] in ('like','comment') and n['target_id'] else '/'))
             content+='<a class="person %s" href="%s">%s<div><b>%s</b> %s<time>%s</time></div></a>'%('unread' if not n['read_at'] else '',dest,avatar(n),esc(n['display_name'] or n['name'] or 'The Quad'),esc(n['body']),esc(date(n['created'])))
         return self.html(shell('Notifications',content+'</section>',user))
+    def listening_refresh(self,user):
+        # Stub, deliberately unimplemented: there are no Spotify credentials
+        # in this codebase and no user's Spotify is connected, so this
+        # endpoint must NOT pretend to sync anything. It only explains
+        # what live sync would need. No state is changed and no tokens
+        # are read, stored or sent anywhere.
+        content=('<section class="card"><h1>Live Spotify sync — not set up</h1>'
+            '<p>Live now-playing is <b>not connected</b>. Nothing on this page has been synced from Spotify, and no song shown here is a live feed.</p>'
+            '<p>Your Listening Note (set by hand on the feed or your profile) still works — it lasts 24 hours and friends can see it.</p>'
+            '<h2>What live sync would need</h2>'
+            '<ul><li>A Spotify developer app configured on the server (client ID and secret — none are stored in this code).</li>'
+            '<li>Each person linking their own Spotify account through Spotify OAuth.</li>'
+            '<li>Permission to read what they are currently playing (<code>user-read-currently-playing</code> scope).</li></ul>'
+            '<p>Until those are set up with Mitchell\'s approval, this page will keep saying not connected — it will not fake a live status.</p>'
+            '<p><a class="btn" href="/">Back to feed</a> <a class="btn light" href="/profile">Set a Listening Note instead</a></p></section>')
+        return self.html(shell('Spotify live sync',content,user))
     def settings(self,user):
         with connect() as c:
             row=c.execute('SELECT private_account FROM user_settings WHERE user_id=?',(user['id'],)).fetchone()
@@ -869,6 +1012,7 @@ class Handler(BaseHTTPRequestHandler):
         if not blocked: content+='<p class="muted">You have not blocked anyone.</p>'
         for m in blocked: content+='<div class="person">%s<b class="grow">%s</b><form method="post" action="/block">%s<input type="hidden" name="user_id" value="%s"><input type="hidden" name="action" value="unblock"><button class="light">Unblock</button></form></div>'%(avatar(m),esc(display(m)),form_csrf(user),m['id'])
         content+='<section class="card"><h2>Change password</h2><p><a class="btn light" href="/change-password">Change your password</a></p></section><section class="card"><h2>Password recovery</h2><p>If you forget your password, the app can email a six-digit reset code. SMTP email delivery must be configured on the server for this feature to send mail.</p></section>'
+        content+='<section class="card"><h2>Spotify — live now-playing</h2><p><b>Live Spotify sync is not set up yet.</b> Your Listening Note is set by hand and lasts 24 hours — that works now, no Spotify account needed.</p><p>To show what you are actually listening to in real time, The Quad would need: a Spotify developer app configured on the server, each person linking their own Spotify account, and permission to read what they are currently playing (<code>user-read-currently-playing</code>). No Spotify tokens are stored by The Quad today, and nothing here claims to be connected.</p><p><a class="btn light" href="/notes/refresh">Check live now-playing status</a></p></section>'
         content+='<section class="card"><h2>Block someone</h2><form method="get" action="/people"><label>Find a member</label><input name="q" placeholder="Search by name"><button class="light">Open People</button></form></section>'
         return self.html(shell('Settings',content,user))
     def public_profile(self,user,key):
@@ -878,8 +1022,10 @@ class Handler(BaseHTTPRequestHandler):
             m=user_by_id(c,uid)
             if m and not can_view_post(c,user['id'],uid):return self.html(shell('Member','<section class="card">This profile is private or unavailable.</section>',user),403)
             posts=c.execute('SELECT * FROM posts WHERE user_id=? ORDER BY created DESC LIMIT 20',(uid,)).fetchall() if m else []
+            member_note=visible_listening_note(c,user['id'],uid) if m else None
         if not m:return self.html(shell('Profile','<section class="card">Member not found.</section>',user),404)
         content='<section class="card">%s<h1>%s</h1><p>%s</p><p><b>Interests:</b> %s</p></section>'%(avatar(m,90),esc(display(m)),esc(m['bio']),esc(m['interests']))
+        if member_note:content+='<section class="card"><h2>Listening Note</h2>%s</section>'%spotify_note_html(member_note, embed=True)
         for p in posts:content+='<article class="card"><time>%s</time><p>%s</p></article>'%(esc(date(p['created'])),esc(p['body']))
         return self.html(shell('Member',content,user))
     def admin(self,user):
@@ -1107,7 +1253,7 @@ class Handler(BaseHTTPRequestHandler):
                 c.execute('DELETE FROM sessions WHERE user_id=? AND token<>?',(user['id'],token))
                 audit_event(c,user['id'],'password_change','user',user['id'],{'forced':bool(user['must_change_password'])})
             return self.go('/')
-        write_limits={'/posts':(30,3600),'/comment':(120,3600),'/message':(300,3600),'/friend':(120,3600),'/block':(60,3600),'/like':(300,3600),'/profile':(30,3600),'/settings':(30,3600),'/delete':(120,3600),'/delete-comment':(120,3600),'/admin/remove-user':(10,3600),'/admin/restore-user':(10,3600)}
+        write_limits={'/posts':(30,3600),'/comment':(120,3600),'/message':(300,3600),'/friend':(120,3600),'/block':(60,3600),'/like':(300,3600),'/profile':(30,3600),'/settings':(30,3600),'/delete':(120,3600),'/delete-comment':(120,3600),'/listening-note':(10,3600),'/admin/remove-user':(10,3600),'/admin/restore-user':(10,3600)}
         if path in write_limits:
             limit,window=write_limits[path]
             if not rate_limit('write:'+path,'%s:%s'%(user['id'],client_fp),limit,window):return self.html(shell('Slow down','<section class="card">Too many requests. Try again shortly.</section>',user),429)
@@ -1186,7 +1332,7 @@ class Handler(BaseHTTPRequestHandler):
                     c.execute('INSERT OR IGNORE INTO user_settings(user_id,private_account) VALUES(?,?)',(remap_user(row.get('user_id')), row.get('private_account')))
                 post_map = {}
                 for row in saved.get('posts',[]):
-                    new_pid = insert_with_id('posts', {**row, 'user_id': remap_user(row.get('user_id'))}, ['id','user_id','body','created','media_key','media_type','music_track'], 'id')
+                    new_pid = insert_with_id('posts', {**row, 'user_id': remap_user(row.get('user_id'))}, ['id','user_id','body','created','media_key','media_type','music_track','spotify_url','spotify_track_id'], 'id')
                     post_map[row.get('id')] = new_pid
                 for row in saved.get('comments',[]):
                     insert_with_id('comments', {**row, 'post_id': post_map.get(row.get('post_id'), row.get('post_id')), 'user_id': remap_user(row.get('user_id'))}, ['id','post_id','user_id','body','created'], 'id')
@@ -1217,20 +1363,41 @@ class Handler(BaseHTTPRequestHandler):
             with connect() as c:c.execute('DELETE FROM sessions WHERE token=?',(token,))
             return self.go('/','network_session=; HttpOnly; %sSameSite=Lax; Path=/; Max-Age=0; Priority=High'%self.secure_cookie())
         if path=='/activity':self.touch(user,token);self.send_response(204);self.security_headers();self.end_headers();return
+        if path=='/listening-note':
+            dest='/profile' if '/profile' in (self.headers.get('Referer') or '') else '/'
+            if data.get('clear')=='1':
+                with connect() as c:
+                    c.execute('DELETE FROM listening_notes WHERE user_id=?',(user['id'],))
+                    audit_event(c,user['id'],'listening_note_clear','user',user['id'])
+                return self.go(dest)
+            title=data.get('track_title','').strip()
+            artist=data.get('artist','').strip()
+            if not title or len(title)>120 or len(artist)>120:
+                return self.html(shell('Listening Note','<section class="card">Give your note a song title (1–120 characters). Artist up to 120 characters.</section>',user),400)
+            spotify_id, spotify_url, spotify_err=parse_spotify_link(data.get('spotify_link',''))
+            if spotify_err:
+                return self.html(shell('Listening Note','<section class="card">%s</section>'%esc(spotify_err),user),400)
+            now=time.time()
+            with connect() as c:
+                c.execute('INSERT INTO listening_notes(user_id,track_title,artist,spotify_url,spotify_track_id,created,expires_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET track_title=excluded.track_title,artist=excluded.artist,spotify_url=excluded.spotify_url,spotify_track_id=excluded.spotify_track_id,created=excluded.created,expires_at=excluded.expires_at',(user['id'],title,artist,spotify_url,spotify_id,now,now+LISTENING_NOTE_TTL))
+                audit_event(c,user['id'],'listening_note_set','user',user['id'],{'track_title':title,'artist':artist,'spotify_track_id':spotify_id})
+            return self.go(dest)
         if path=='/posts':
             body=data.get('body','').strip()
             if len(body)>2000:return self.html(shell('Post','Post text must be 2,000 characters or less.',user),400)
             try:up=self.save_upload(user,fields=data,files=files,name='media',kind='post')
             except ValueError as e:return self.html(shell('Upload',esc(e),user),400)
-            if not body and not up:return self.html(shell('Post','Write text or attach a photo/video.',user),400)
             track=data.get('music_track','').strip()
             if track not in MUSIC_TRACKS:track=''
+            post_spotify_id, post_spotify_url, post_spotify_err=parse_spotify_link(data.get('spotify_link',''))
+            if post_spotify_err:return self.html(shell('Post',esc(post_spotify_err),user),400)
+            if not body and not up and not post_spotify_id:return self.html(shell('Post','Write text, attach a photo/video, or add a Spotify track.',user),400)
             with connect() as c:
                 # Duplicate-spam filter: the same user posting identical text
                 # (or an identical comment) within 60 seconds is rejected.
                 if body and c.execute('SELECT 1 FROM posts WHERE user_id=? AND body=? AND created>?',(user['id'],body,time.time()-60)).fetchone():
                     return self.html(shell('Post','You just posted the same thing. Wait a minute before posting it again.',user),429)
-                c.execute('INSERT INTO posts(user_id,body,created,media_key,media_type,music_track) VALUES(?,?,?,?,?,?)',(user['id'],body,time.time(),up[0] if up else None,up[1] if up else None,track or None))
+                c.execute('INSERT INTO posts(user_id,body,created,media_key,media_type,music_track,spotify_url,spotify_track_id) VALUES(?,?,?,?,?,?,?,?)',(user['id'],body,time.time(),up[0] if up else None,up[1] if up else None,track or None,post_spotify_url,post_spotify_id))
             return self.go('/')
         if path=='/delete':
             try:pid=int(data.get('post_id',''))
