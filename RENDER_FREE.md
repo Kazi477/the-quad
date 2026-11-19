@@ -286,3 +286,40 @@ Fix: a single-writer lock in db_backend.py (_WRITE_LOCK,
 reads stay concurrent. start.sh health gate raised 60s ->
 120s (cold starts pull the replica Oregon -> Sydney). Full
 suite: 594 checks + smoke PASS. See MERGE_NOTES.md Update 16.
+
+## Update 17 — Render deploy failure: serve first, gate second (2026-11-20)
+
+Both auto-deploys of Update 16 (commits 18cd219, 4e16273)
+FAILED at Render's health check after 14m/18m: "Timed out
+after waiting for internal health check to return a
+successful response code", then "Port scan timeout reached,
+no open HTTP ports detected". Root cause, proven in dev:
+Update 14 bound the socket first but still ran the database
+gate BEFORE serve_forever(), so nothing ACCEPTED a
+connection until the gate finished — and the gate does a
+Turso sync plus ~50 schema writes to Sydney, far longer
+than Render's 5s health-check budget and start.sh's 2s
+probe timeout. Every probe timed out, start.sh killed the
+app, nginx never started, and the port scan found nothing
+for 15 minutes. The log's "within 60s" was a stale string
+(the loop had been raised to 120s in Update 16, the message
+never updated — there is no second 60s timeout). Also:
+BaseHTTPRequestHandler has no do_HEAD, so Render's HEAD /
+probes got 501; and /healthz used to open a fresh Turso
+connection per probe, so the first probe paid a full
+cross-Pacific sync.
+Fix (dev only): serve_forever() runs in a thread BEFORE
+the database gate; /healthz is liveness-only and answers
+in milliseconds without touching the database; new
+/readyz reports database readiness (200 after the gate,
+503 before); do_HEAD answers health endpoints like GET
+and 200s anything else instead of 501; start.sh probe
+timeout 2s -> 5s and its FATAL message corrected to 120s;
+startup backup threads start only after the gate passes.
+A gate that FAILS still kills the process loudly (FATAL,
+exit 1). Full suite: 619 checks + smoke PASS, 0 failed
+(new deployfix_test.py, 25 checks). See MERGE_NOTES.md
+Update 17. To deploy after approval: upload to GitHub
+(e.g. upload10/), redeploy, verify deploy Live (not
+health-check timeout), GET / 200, /healthz ok, HEAD / 200,
+/readyz 200, then re-run the dummy-account live test.

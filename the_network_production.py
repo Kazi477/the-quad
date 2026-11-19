@@ -59,6 +59,11 @@ REMOVED_DIR.mkdir(parents=True, exist_ok=True)
 if PRODUCTION and not os.environ.get('APP_SECRET'):
     print('WARNING: APP_SECRET is not set. Set a stable random APP_SECRET in production.')
 
+# Update 17: database-readiness flag. Set by main() once
+# ensure_database_healthy() passes; /readyz reads it. /healthz
+# (liveness) deliberately does NOT read it — see _healthz.
+_DB_READY = threading.Event()
+
 
 def connect():
     # Update 10 (Render free + Turso): when TURSO_DATABASE_URL and
@@ -211,6 +216,16 @@ def init_db():
 
 
 def ensure_database_healthy():
+    # Update 17 (test hook only): QUAD_GATE_DELAY_SECONDS makes
+    # the gate sleep that long before touching the database, so a
+    # regression test can prove the server answers /healthz while
+    # the gate is still running. Never set in production.
+    _gate_delay = os.environ.get('QUAD_GATE_DELAY_SECONDS', '').strip()
+    if _gate_delay:
+        try:
+            time.sleep(float(_gate_delay))
+        except ValueError:
+            pass
     """Startup database gate (Update 14).
 
     Runs init_db() and then PRAGMA quick_check. If either fails
@@ -1224,19 +1239,73 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             print('touch: last_seen update failed:',type(exc).__name__,exc)
     def _healthz(self):
-        # The health check answers without rendering anything and
-        # without a session: Render (and start.sh) must be able to
-        # tell 'app up, DB down' (503) from 'app not listening at
-        # all' (connection refused). It is called from do_GET
-        # BEFORE _do_GET, so a crash in any page handler can never
-        # take the health check down with it (Update 15).
+        # Update 17 (Render deploy failure, 2026-11-19/20): /healthz
+        # is a LIVENESS check only — "this process is up and
+        # serving" — and must answer in milliseconds, WITHOUT
+        # touching the database. It used to open a fresh Turso
+        # replica connection (SELECT 1) on every probe: on a cold
+        # start that first connect does a cross-Pacific sync, and
+        # Render's HTTP health check only allows 5 SECONDS, so a
+        # slow first connect failed the deploy even though the app
+        # was fine — and start.sh's own gate probe (2s timeout)
+        # timed out the same way, so nginx never started and
+        # Render's port scan found nothing for 15 minutes until
+        # the deploy was cancelled. The database has its own
+        # readiness signal (/readyz, below); liveness must never
+        # depend on it. Called from do_GET before _do_GET, and
+        # from do_HEAD (headers only).
+        body = b'ok'
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.security_headers()
+        self.end_headers()
+        if self.command != 'HEAD':
+            self._write(body)
+
+    def _readyz(self):
+        # Update 17: readiness — 200 only once the startup
+        # database gate has passed (ensure_database_healthy in
+        # main). Before that, 503 'not ready yet' — a fast,
+        # honest answer, never a hang. start.sh does not gate on
+        # this (nginx starts on liveness); it exists so a human
+        # or a future readiness probe can tell 'up but DB not
+        # ready' from 'up and ready'.
+        ready = _DB_READY.is_set()
+        body = b'ready' if ready else b'not ready yet'
+        self.send_response(200 if ready else 503)
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.security_headers()
+        self.end_headers()
+        if self.command != 'HEAD':
+            self._write(body)
+
+    def do_HEAD(self):
+        # Update 17: BaseHTTPRequestHandler has no do_HEAD, so
+        # every HEAD request used to get 501 'Unsupported method'.
+        # Render's port/health checker issues HEAD / (seen in the
+        # live logs, 2026-11-19), so a 501 there is a needless
+        # failure signal. Answer HEAD exactly like GET for the
+        # health endpoints (same status and Content-Length, no
+        # body); for any other path, answer 200 with an empty
+        # body rather than a 501 — HEAD must never return a body,
+        # and a 501 says 'this server cannot do HTTP' when it can.
         try:
-            with connect() as c:c.execute('SELECT 1').fetchone()
-            if not os.access(DATA_DIR,os.W_OK):raise OSError('data directory not writable')
-            body=b'ok';status=200
-        except Exception:
-            body=b'unhealthy';status=503
-        self.send_response(status);self.send_header('Content-Type','text/plain; charset=utf-8');self.send_header('Content-Length',str(len(body)));self.security_headers();self.end_headers();self._write(body)
+            path = urllib.parse.urlparse(self.path).path
+            if path in ('/health', '/healthz'):
+                return self._healthz()
+            if path == '/readyz':
+                return self._readyz()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', '0')
+            self.security_headers()
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:
+            print('do_HEAD failed:', type(exc).__name__, exc)
     def do_GET(self):
         # Update 15: top-level guard. Before this, ANY unhandled
         # exception in a page handler (a DB error in feed(),
@@ -1251,6 +1320,8 @@ class Handler(BaseHTTPRequestHandler):
             path=urllib.parse.urlparse(self.path).path
             if path in ('/health','/healthz'):
                 return self._healthz()
+            if path == '/readyz':
+                return self._readyz()
             self._do_GET()
         except (BrokenPipeError, ConnectionResetError):
             pass
@@ -1261,6 +1332,8 @@ class Handler(BaseHTTPRequestHandler):
         path=urllib.parse.urlparse(self.path).path
         if path in ('/health','/healthz'):
             return self._healthz()
+        if path == '/readyz':
+            return self._readyz()
         user,token=self.session()
         if path not in ('/app.js','/app.css','/activity.js','/favicon.ico') and not path.startswith('/media/'):
             # Count actual pages, not polling requests or media fetches. Do not collect IPs.
@@ -2810,31 +2883,49 @@ class NetworkHTTPServer(ThreadingHTTPServer):
 
 def main():
     if not 1<=PORT<=65535:raise ValueError('PORT must be between 1 and 65535.')
-    # Update 14: bind the listening socket FIRST, then check the
-    # database. The live failure of 2026-11-19 was a process that
-    # died in init_db()/quick_check (malformed replica) before it
-    # ever bound 8081, so nginx got 'connection refused' on
-    # /healthz and there was no app alive to answer anything.
-    # Binding first means the socket exists while the DB gate
-    # runs; if the gate rebuilds the replica, serving starts
-    # straight after, and if the gate cannot heal the DB, main()
-    # exits loudly (FATAL in the log, Render restarts) instead of
-    # leaving nginx proxying to a dead process indefinitely.
+    # Update 17 (Render deploy failure, 2026-11-19/20 — the fix
+    # for the failed 18cd219/4e16273 deploys): SERVE FIRST, then
+    # check the database. Update 14 bound the socket first but
+    # still ran ensure_database_healthy() BEFORE serve_forever(),
+    # so the port was bound but nothing ever ACCEPTED a
+    # connection until the gate finished. On a cold start the
+    # gate does a Turso sync plus ~50 schema writes forwarded
+    # to Sydney, which can take far longer than Render's 5s
+    # health-check budget and start.sh's 2s probe timeout — so
+    # every probe timed out, start.sh killed the app after its
+    # gate (the log's 'within 60s' was a stale string; the loop
+    # had been raised to 120s), nginx never started, Render's
+    # port scan found nothing for 15 minutes, and the deploy
+    # was cancelled — while the app log showed /healthz 200s,
+    # which were the server-side completions of probes whose
+    # clients had already given up. Now the server thread
+    # starts accepting immediately, /healthz answers in
+    # milliseconds without touching the DB, and the gate runs
+    # in the main thread; pages degrade gracefully (signed-out
+    # / 500) until the gate passes and _DB_READY is set. Only
+    # a gate that FAILS (unrecoverable DB) still kills the
+    # process — loudly, via FATAL — so Render restarts it.
     srv=NetworkHTTPServer((HOST,PORT),Handler)
+    serve_thread = threading.Thread(target=srv.serve_forever,
+                                    kwargs={'poll_interval': 0.5},
+                                    name='http-server', daemon=True)
+    serve_thread.start()
+    print('The Campus is listening on %s:%s'%(HOST,PORT))
+    print('Mode:','production' if PRODUCTION else 'development')
     try:
         ensure_database_healthy()
-    except Exception:
+    except Exception as exc:
+        print('FATAL: The Campus cannot start: database is '
+              'unusable: %s' % exc)
+        srv.shutdown()
         srv.server_close()
-        raise
-    # Update 15: the startup backup used to run synchronously
-    # here, before serve_forever — it syncs the Turso replica
-    # and copies the database, which on a slow first start can
-    # add many seconds between binding the port and answering
-    # /healthz (and start.sh waits on /healthz, and Render's
-    # health check waits on nginx). A backup is not worth
-    # delaying the first response for; run it in the background
-    # once the server is about to serve. The shutdown backup in
-    # the finally block below is unchanged.
+        raise SystemExit(1) from exc
+    _DB_READY.set()
+    # Update 17: the startup backup used to start before
+    # serve_forever (Update 15 moved it to a thread, but it
+    # still ran while the first health checks were landing and
+    # its Turso sync competed with them for the replica). It
+    # now starts only after the database is proven ready.
     threading.Thread(target=backup_database, name='database-backup-startup', daemon=True).start()
     threading.Thread(target=backup_worker,name='database-backups',daemon=True).start()
     if os.environ.get('SMTP_HOST') and os.environ.get('SMTP_FROM'):
@@ -2846,8 +2937,6 @@ def main():
     if PRODUCTION and not shutil.which('ffprobe'):
         print('WARNING: ffprobe is unavailable. Production video uploads will be rejected until ffprobe is installed.')
     url='http://127.0.0.1:%s'%PORT
-    print('The Campus is listening on %s:%s'%(HOST,PORT))
-    print('Mode:','production' if PRODUCTION else 'development')
     if not HOSTED:print('Open it on this device:',url)
     else:print('Open the HTTPS URL provided by your host.')
     print('Database:',DB_PATH)
@@ -2873,7 +2962,11 @@ def main():
         except Exception as exc:print('Automatic browser launch is unavailable (%s). Open %s in Safari.'%(exc,url))
     if not HOSTED:
         timer=threading.Timer(1.0,open_browser);timer.daemon=True;timer.start()
-    try:srv.serve_forever(poll_interval=0.5)
+    try:
+        # The server thread is already serving; wait here until
+        # it stops (shutdown signal) instead of serve_forever().
+        while serve_thread.is_alive():
+            serve_thread.join(timeout=0.5)
     finally:
         srv.server_close()
         backup_database()

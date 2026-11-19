@@ -401,9 +401,16 @@ def db_backend_tests():
 # ---------------------------------------------------------- deploy files
 def deploy_file_tests():
     start = (ROOT / 'start.sh').read_text()
+    # Update 17: the FATAL message says 120s now (the loop was
+    # raised to 240 x 0.5s in Update 16 but the message still
+    # said 60s — that stale string is what the live 2026-11-19
+    # log showed). The gate itself is unchanged in shape: exit
+    # (no nginx) if the app never answers /healthz; /healthz is
+    # now liveness-only, so 'never healthy' means the process
+    # itself is not serving.
     check('start.sh: exits if app never becomes healthy',
           'healthy=1' in start
-          and 'FATAL: app did not become healthy within 60s' in start
+          and 'FATAL: app did not become healthy within 120s' in start
           and "nginx -g 'daemon off;'" in start)
     check('start.sh: nginx starts only after the health check',
           start.index('/healthz') < start.index("nginx -g 'daemon off;"))

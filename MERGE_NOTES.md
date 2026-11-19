@@ -2179,3 +2179,142 @@ repro wedge), BrokenPipe (handled in Update 15).
   /register twice in a row quickly (the exact sequence that
   502d before). Then let the instance sleep and check GET /
   still returns 200 after it wakes.
+
+## Update 17 — Render deploy failure: serve first, gate second (2026-11-20)
+
+### What happened live
+Both auto-deploys of the Update 16 flapping fix (commits 18cd219
+and 4e16273, same code) FAILED at Render's health check — "Timed
+out after waiting for internal health check to return a
+successful response code" — after 14m and 18m. Logs: "FATAL: app
+did not become healthy within 60s; not starting nginx" at
+23:51:05, then "Exited with status 1". Second deploy: app
+starting 23:51:48, /healthz returning 200 repeatedly, HEAD /
+returning 501 "Unsupported method ('HEAD')", then Render "No
+open HTTP ports detected on 0.0.0.0, continuing to scan..." and
+"Port scan timeout reached, no open HTTP ports detected..." at
+00:06-00:09. Live stayed on commit 251d0c5 and kept flapping.
+
+### Root cause, proven in dev
+1. **Bound is not serving.** Update 14 bound the socket first
+   but still ran ensure_database_healthy() BEFORE
+   serve_forever(), so the port was bound but nothing ACCEPTED
+   a connection until the gate finished. On a cold start the
+   gate does a Turso sync plus ~50 schema writes forwarded to
+   Sydney — far longer than Render's 5s health-check budget
+   (Render docs: HTTP health checks must answer 2xx/3xx
+   within 5 seconds; deploy cancelled if not healthy within
+   15 minutes) and start.sh's 2s probe timeout. Every probe
+   timed out, start.sh killed the app after its gate, nginx
+   never started, Render's port scan found nothing, and the
+   deploy was cancelled. The /healthz 200s in the app log were
+   the server-side completions of probes whose clients had
+   already given up.
+2. **The '60s' in the log was a stale string.** The Update 16
+   loop had been raised to 240 attempts x 0.5s = 120s, but the
+   FATAL message was never updated — the gate waited 120s, not
+   60s. Verified: dev start.sh has the 240-attempt loop and
+   the 120s change is in commit 18cd219 (+12/-2 on start.sh);
+   there is no second 60s timeout in start.sh, Dockerfile or
+   main(). The other 60s values are nginx proxy timeouts.
+3. **HEAD 501.** BaseHTTPRequestHandler has no do_HEAD, so
+   every HEAD request got 501. Render's checker issues HEAD /
+   (seen in live logs). Update 16's notes called this
+   "expected and harmless" — it is not: a 501 says the server
+   cannot do HTTP.
+4. **/healthz did a database round-trip per probe.** It opened
+   a fresh Turso replica connection (SELECT 1) on every probe,
+   so the first probe after a cold start paid a full
+   cross-Pacific sync. A health check must never depend on
+   the thing it is checking.
+
+### What changed (dev only)
+- the_network_production.py 2882 -> 2975 lines
+  (.bak-deployfix17 kept): serve_forever() now runs in a
+  thread BEFORE ensure_database_healthy(); the gate runs in
+  the main thread and sets _DB_READY on success. A gate that
+  FAILS still kills the process loudly (FATAL, exit 1) so
+  Render restarts it. /healthz is liveness-only — returns
+  200 'ok' in milliseconds without touching the database.
+  New /readyz: 200 only after the gate passes, 503 before.
+  New do_HEAD: health endpoints answer like GET (headers
+  only); other paths answer 200 with an empty body instead
+  of 501. Startup backup threads start only after the gate
+  passes (their Turso sync no longer competes with the first
+  health checks). Test hook only: QUAD_GATE_DELAY_SECONDS
+  sleeps inside the gate so tests can prove serving-during-
+  gate; never set in production.
+- start.sh 76 lines, unchanged length (.bak-deployfix17
+  kept): probe timeout 2s -> 5s (matching Render's budget);
+  FATAL message corrected to 120s (and the stale 'just 60
+  seconds later' comment). The gate still waits for /healthz
+  (now liveness, fast) before starting nginx, and still
+  exits if the app process dies.
+- New deployfix_test.py (316 lines, 25 checks). fixall_test.py
+  updated: its start.sh check asserted the literal 'within
+  60s' string — updated to 'within 120s' (behaviour
+  unchanged: exit if the app never answers liveness).
+- No branding, features, routes, or auth behaviour changed
+  when healthy. No payment, no credentials.
+
+### Verification (dev)
+- Repro vs local sqld primary (libsql-experimental 0.0.55),
+  pre-fix code: HEAD /healthz and HEAD / both 501; first
+  /healthz 200 at 0.6s (local sync is fast — the live
+  slowness is the cross-Pacific sync, which dev cannot
+  reproduce in wall-clock terms).
+- Same repro, post-fix code: HEAD /healthz and HEAD / both
+  200, /healthz 200 at 0.6s, burst 5x /healthz all 200.
+- deployfix_test.py: 25 passed, 0 failed — with the gate
+  delayed 6s, /healthz answers 200 within 2s of process
+  start, /readyz is 503 during the delay and 200 after,
+  HEAD endpoints answer 200 with an empty body, GET /
+  answers promptly during the delay (500, DB not ready)
+  and 200 after; same in plain-sqlite and Turso-local
+  modes; start.sh (sandboxed copy, stub nginx/envsubst)
+  starts nginx on liveness despite the 6s gate delay.
+- Full suite re-run: smoke PASS; merge 51, auth 25,
+  security 84, fix 32, listening 44, top5 78, forgot 45,
+  failover 31, pythonanywhere 12, render_free 30,
+  object_storage 68, wal502 20, malformed502 25, fixall 23,
+  flap 26, deployfix 25 — 619 checks + smoke PASS, 0
+  failed. Backup zip md5 re-verified unchanged:
+  aae87ec977f13b371de50aedb192cd96.
+
+### Remaining risks / honest limits
+- Real Turso cloud sync + a real Render spin-down still
+  cannot be tested in dev; the first live deploy is the
+  true proof. Watch the first minutes of live logs for:
+  'The Campus is listening' followed quickly by /healthz
+  200s, no 'FATAL: app did not become healthy', and no
+  'Port scan timeout'. If the gate itself is slow on live
+  (cold Turso sync + ~50 schema writes), pages will 500
+  briefly until _DB_READY flips — that is expected and
+  self-heals; it no longer fails the deploy.
+- init_db still issues ~50 schema statements as remote
+  writes on every cold start; on a slow primary that is
+  tens of seconds of gate time. It is now non-blocking for
+  the deploy, so it was left as-is; if live readiness is
+  slow, the next step is to skip CREATE TABLEs whose
+  objects already exist (read sqlite_master once, diff).
+- Each request still opens fresh libSQL connections with a
+  cross-Pacific handshake (~0.2-1s each); page latency
+  under load is unchanged by this fix.
+- If the database is genuinely unrecoverable, main() still
+  exits 1 after the gate fails — Render restarts the
+  container and the deploy fails loudly, as it should.
+
+### To deploy after Mitchell approves
+- Upload to GitHub (new staging dir, e.g. `upload10/`),
+  then redeploy the-quad-free on Render (auto-deploy on
+  commit should trigger; verify manually if it does not).
+  No env var or secret changes. After deploy, verify:
+  deploy status Live/succeeded (not 'Timed out after
+  waiting for internal health check'), GET / 200,
+  /healthz ok, HEAD / 200, /readyz 200, then RE-RUN the
+  full dummy-account live test from scratch (create
+  'Sydney Test', post, log out/in, delete it, confirm it
+  cannot log in again), including a recovery-code reset,
+  and hit /register twice in a row quickly (the exact
+  sequence that 502d before). Then let the instance sleep
+  and check GET / still returns 200 after it wakes.
