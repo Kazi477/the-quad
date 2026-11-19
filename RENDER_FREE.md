@@ -323,3 +323,23 @@ Update 17. To deploy after approval: upload to GitHub
 (e.g. upload10/), redeploy, verify deploy Live (not
 health-check timeout), GET / 200, /healthz ok, HEAD / 200,
 /readyz 200, then re-run the dummy-account live test.
+
+## Update 18 — Live failures: text-only post 400, confirm() blocking recovery/delete (2026-11-20)
+- Text-only posts from a browser failed with 400 ("Posts support
+  JPEG...") because browsers always send an empty file part for an
+  untouched file input; read_form() now drops empty file parts and
+  save_upload() treats an empty file as no file. Urlencoded tests
+  never sent a file part, so no suite had caught it; livefix_test.py
+  now posts browser-style multipart (26 checks).
+- Recovery-code generation and self-delete did nothing live: both
+  forms were gated on native confirm(), which automated browsers
+  auto-dismiss, cancelling the submit with no error. confirm() is
+  removed; data-confirm forms now use an inline two-step
+  confirmation ("Click again to confirm", message shown in-page).
+- The single 502 on the third live post attempt was not reproduced
+  in plain-sqlite dev; it matches the known Turso write-wedge
+  pattern. Watch live logs for "Transaction timed-out" /
+  "database write lock timed out" after redeploy.
+- Live cleanup needed before re-testing: sydneytest@example.com
+  and sydneytest-20261120@example.com both exist live (stale test
+  accounts) and must be removed via the admin panel / DB first.

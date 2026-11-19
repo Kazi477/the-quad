@@ -2318,3 +2318,106 @@ open HTTP ports detected on 0.0.0.0, continuing to scan..." and
   and hit /register twice in a row quickly (the exact
   sequence that 502d before). Then let the instance sleep
   and check GET / still returns 200 after it wakes.
+
+## Update 18 — Three live failures from the dummy-account test (2026-11-20, live commit 2f7b770)
+
+All three were reproduced in dev with a local server + test client
+before fixing. Dev only; NOT deployed, NOT uploaded to GitHub.
+
+### 1. Text-only posting failed (400, near-blank /posts "Upload" page)
+Root cause: a real browser ALWAYS sends the file part for an
+untouched <input type=file> — filename="" and an empty body — in a
+multipart post. read_form() kept that empty part as a file with
+content-type application/octet-stream, and save_upload() rejected
+it with "Posts support JPEG, PNG, GIF, WebP, MP4 and WebM." (400).
+So EVERY text-only post from a browser failed, while urlencoded
+test posts (which never send a file part) passed — which is why no
+test suite had ever caught it. Direct GET /posts returning "Page
+not found" is by design (there is no GET /posts page; POST is the
+only route), not a bug.
+Fix: read_form() now drops file parts with an empty filename
+("no file at all"); save_upload() also returns None for an empty
+filename / empty data, as defence in depth (covers /profile avatar
+too). A real file with a non-image/video type is still rejected.
+The single 502 on the third live attempt was NOT reproduced in
+plain-sqlite dev: it matches the known Turso write-wedge/flapping
+pattern (Update 16) — each request opens fresh libSQL connections
+with cross-Pacific handshakes, and a slow Turso write can still
+hang a request past nginx's timeout. Fixing the 400 means a text
+post now completes in one write instead of repeated retries, which
+reduces that exposure, but live Turso latency cannot be proven in
+dev; watch live logs for "Transaction timed-out" / "database write
+lock timed out" after redeploy.
+
+### 2 & 3. Recovery-code generation and self-delete did nothing
+Root cause (shared): both forms carry data-confirm, and /app.js
+gated them on the native confirm() dialog. Automated browsers
+auto-dismiss confirm() dialogs (returning false), so the submit
+was cancelled every time — no navigation, no error, no codes, no
+delete. The differential evidence is decisive: "Save settings"
+(no data-confirm) worked live, both data-confirm forms failed,
+and both handlers work server-side in dev (regenerate returns
+10 codes shown once; non-admin self-delete signs out and login
+then fails 401). JS syntax is valid and /app.js loads; the
+dialog was the only gate. A human clicking OK in a real browser
+would have succeeded — which is why this was never seen in
+manual use — but any automated test, and any browser/dialog
+handling that dismisses, breaks these actions silently.
+Fix: native confirm() is gone from /app.js. data-confirm forms
+now use an inline two-step confirmation: first click arms the
+form (button becomes "Click again to confirm", the message is
+shown in the page as a .confirm-note, arming expires after 10s),
+second click submits. This applies to every data-confirm form
+(recovery codes, self-delete, post removal, admin remove/restore,
+clear Listening Note). No server behaviour changed.
+
+### What changed
+- the_network_production.py (2,975 lines; .bak-livefix18 kept):
+  read_form() empty-file-part drop, save_upload() empty guard,
+  /app.js submit handler (confirm() -> inline arming), CSS
+  .confirm-note rule.
+- New livefix_test.py: 26 checks.
+- No branding, features, routes, or auth behaviour changed when
+  healthy. No payment, no credentials.
+
+### Test results — 641 checks + smoke PASS, 0 failed
+smoke PASS; merge 51, auth 25, security 84, fix 32, listening 44,
+top5 78, forgot 45, failover 31, pythonanywhere 12, render_free 30,
+object_storage 68, wal502 20, malformed502 25, fixall 23, flap 22
+(+2 skipped, remote sqld not running), deployfix 25, livefix 26
+(new). Pre-fix repro: multipart text-only post returned 400
+"Posts support JPEG..." with no post created; post-fix it returns
+303 and the post appears in the feed. Backup zip md5 re-verified
+unchanged: aae87ec977f13b371de50aedb192cd96.
+
+### Remaining risks / honest limits
+- The live 502 on the third post attempt is not proven fixed in
+  dev (Turso cloud latency/wedge, see above). If it recurs live,
+  the next step is per-thread connection reuse or reducing
+  per-request Turso connections — not another recovery layer.
+- Live test-data note (NOT a product bug): sydneytest@example.com
+  already existed before the Fri 20 Nov test (from the earlier
+  unconfirmed registration in the frozen browser task), so
+  registering it again says "account is ready" while login fails
+  with that earlier attempt's unknown password. Both
+  sydneytest@example.com and the diagnostic
+  sydneytest-20261120@example.com still exist live and need
+  admin/DB cleanup (remove via admin panel, or delete the rows)
+  before the dummy test is re-run — otherwise the test will keep
+  tripping over the stale account.
+
+### To deploy after Mitchell approves
+- Upload to GitHub (new staging dir, e.g. `upload11/`), then
+  redeploy the-quad-free on Render (auto-deploy on commit should
+  trigger; verify manually if it does not). No env var or secret
+  changes. After deploy, verify: GET / 200, /healthz ok, HEAD /
+  200, /readyz 200. Then RE-RUN the full dummy-account live test
+  from scratch on a FRESH diagnostic email (after cleaning up the
+  two leftover test accounts above): create account, post a
+  TEXT-ONLY post from the composer (the exact failing case) and
+  confirm it appears in the feed, log out/in, generate recovery
+  codes in Settings and confirm the 10 codes are shown, use one
+  code on Forgot password to reset, log in with the new password,
+  then self-delete the account and confirm login then fails.
+  Then let the instance sleep and check GET / still returns 200
+  after it wakes.
