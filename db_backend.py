@@ -102,6 +102,61 @@ _WAL_PROBE_DONE = False
 # normal (healthy) path.
 _RECOVERY_LOCK = threading.Lock()
 
+# Update 16 (live flapping crash, 2026-11-19): SINGLE-WRITER lock
+# for the Turso embedded replica.
+#
+# Proven in dev against a local sqld primary (libsql-experimental
+# 0.0.55): 10 threads x 5 concurrent connect + BEGIN IMMEDIATE +
+# INSERT + SELECT + commit took 220 seconds, only 11 of 50
+# succeeded, 39 failed with 'Remote SQlite failure: 2:0:
+# Transaction timed-out' (5s/15s), one op taking 115s — while the
+# identical read-only workload took 0.1s with 0 errors, and the
+# identical workload against plain sqlite3 took 0.1s. The replica
+# forwards writes to the primary, the primary allows one write
+# transaction at a time with a ~5s budget, and queued write
+# transactions burn that budget while waiting — then fail, and
+# the app retries them, re-queueing. Every page view is a write
+# transaction (rate_limit() BEGIN IMMEDIATE + page_views INSERT,
+# session touch UPDATEs), so even a couple of simultaneous
+# visitors — or a visitor plus the startup backup thread's sync —
+# wedge the site: requests hang past nginx's 60s read timeout
+# and Render answers 502, while /healthz (read-only, fast) stays
+# green, so start.sh and Render both think the app is healthy.
+# That is the load-once-then-502-then-load-again flapping of
+# 2026-11-19 22:57-23:12: the queue eventually drains, one
+# request gets through, the next batch re-wedges it.
+#
+# The fix: at most ONE write transaction is ever in flight
+# against the replica, enforced here in the wrapper (every write
+# path in the app goes through _Connection.execute /
+# executemany / executescript; the app never uses raw cursors).
+# A write statement acquires this lock and it is held until the
+# transaction ends (commit / rollback / close). Reads never take
+# it, so reads stay concurrent and fast. A waiter gives up after
+# _WRITE_LOCK_TIMEOUT_SECONDS and raises an error whose message
+# contains 'locked', so rate_limit() treats it as transient and
+# falls back to in-memory counters, and other writers fail
+# honestly with a 500 instead of hanging for 115s and 502ing
+# everyone. The timeout must stay short: a healthy write
+# transaction is a few round trips, well under the primary's 5s
+# budget, so 10s covers several queued writers; waiting longer
+# just re-creates the wedge locally.
+_WRITE_LOCK = threading.RLock()
+_WRITE_LOCK_TIMEOUT_SECONDS = 10
+_WRITE_KEYWORDS = ('INSERT', 'UPDATE', 'DELETE', 'REPLACE', 'BEGIN',
+                   'CREATE', 'DROP', 'ALTER', 'TRUNCATE', 'REINDEX',
+                   'VACUUM')
+
+
+def _is_write_sql(sql):
+    """True for statements that open or perform a write
+    transaction on the replica (and so must hold the single-writer
+    lock). Plain SELECTs and PRAGMAs are reads and never take it."""
+    s = str(sql).lstrip().upper()
+    while s.startswith('('):
+        s = s[1:].lstrip()
+    return s.startswith(_WRITE_KEYWORDS)
+
 
 def _is_corrupt_error(exc):
     """True for 'the local database file itself is damaged'
@@ -331,9 +386,42 @@ class _Connection:
         self._db_path = str(db_path)
         self._sync_url = sync_url
         self._auth_token = auth_token
+        # Update 16: how many times this connection has acquired
+        # the single-writer lock (one acquire per write statement,
+        # so a multi-statement transaction holds it throughout).
+        # Released in full by commit/rollback/close, in a finally,
+        # so a connection dropped mid-transaction can never leave
+        # the lock held and wedge every later writer.
+        self._write_acquires = 0
+
+    def _acquire_write_lock(self):
+        """Take the single-writer lock for one write statement.
+        RLock: the same thread re-acquiring (multi-statement
+        transaction) succeeds at once; another thread waits up to
+        the timeout and then fails loudly instead of queueing
+        behind the primary's 5s transaction budget."""
+        acquired = _WRITE_LOCK.acquire(timeout=_WRITE_LOCK_TIMEOUT_SECONDS)
+        if not acquired:
+            raise sqlite3.Error(
+                'database write lock timed out: another writer '
+                'holds the replica write lock (database is locked)')
+        self._write_acquires += 1
+
+    def _release_write_lock(self):
+        """Release every acquire this connection holds. Never
+        raises: a release failure must not mask the commit /
+        rollback result that triggered it."""
+        acquires, self._write_acquires = self._write_acquires, 0
+        for _ in range(acquires):
+            try:
+                _WRITE_LOCK.release()
+            except RuntimeError:
+                pass
 
     # -- execution ------------------------------------------------
     def execute(self, sql, params=()):
+        if _is_write_sql(sql):
+            self._acquire_write_lock()
         try:
             raw_cur = self._raw.execute(sql, params)
         except Exception as exc:
@@ -341,6 +429,8 @@ class _Connection:
         return _Cursor(raw_cur)
 
     def executemany(self, sql, seq):
+        if _is_write_sql(sql):
+            self._acquire_write_lock()
         try:
             raw_cur = self._raw.executemany(sql, seq)
         except Exception as exc:
@@ -348,6 +438,10 @@ class _Connection:
         return _Cursor(raw_cur)
 
     def executescript(self, sql):
+        # A script mixes statements (init_db's CREATE TABLEs); treat
+        # the whole script as a write so the transaction it opens
+        # cannot interleave with another writer's.
+        self._acquire_write_lock()
         try:
             raw_cur = self._raw.executescript(sql)
         except Exception as exc:
@@ -363,15 +457,22 @@ class _Connection:
             self._raw.commit()
         except Exception as exc:
             raise _translate_error(exc) from None
+        finally:
+            self._release_write_lock()
 
     def rollback(self):
         try:
             self._raw.rollback()
         except Exception:
             pass
+        finally:
+            self._release_write_lock()
 
     def close(self):
-        self._raw.close()
+        try:
+            self._raw.close()
+        finally:
+            self._release_write_lock()
 
     def __enter__(self):
         return self

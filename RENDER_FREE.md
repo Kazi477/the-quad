@@ -272,3 +272,17 @@ are unchanged; images ≤ 8 MB unchanged.
   Docker build was NOT run (no Docker in this dev VM) — the
   Dockerfile change (pip install + copy db_backend.py) must be
   proven by the first Render build.
+
+## Update 16 — flapping crash: concurrent replica writes (2026-11-19)
+
+Live 22:57-23:12 AEST: homepage loaded once, then the next
+request 502d, then it recovered minutes later and repeated.
+Root cause, proven in dev: concurrent write transactions on
+the libSQL embedded replica time out on the primary (one
+writer at a time, ~5s budget) — 10 threads x 5 writes took
+220s with 39/50 failing pre-fix, while reads took 0.1s.
+Fix: a single-writer lock in db_backend.py (_WRITE_LOCK,
+10s timeout) — at most one write transaction in flight;
+reads stay concurrent. start.sh health gate raised 60s ->
+120s (cold starts pull the replica Oregon -> Sydney). Full
+suite: 594 checks + smoke PASS. See MERGE_NOTES.md Update 16.

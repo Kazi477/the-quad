@@ -2047,3 +2047,135 @@ and end: `aae87ec977f13b371de50aedb192cd96`.
   recovery → make codes → log out → reset with one code → log in
   with the new password). Then let the instance sleep and check
   GET / still returns 200 after it wakes.
+
+## Update 16 — Flapping crash: single-writer lock for the Turso replica (DEV ONLY, 2026-11-19)
+
+### Live symptom (2026-11-19 22:57-23:12 AEST, dummy-account test)
+Homepage loads once after a wait/reload, then the very next
+request (/register, then even / again) returns Render 502
+"service is currently unavailable", then after a few minutes a
+reload wakes it again and the cycle repeats. Three /register
+attempts all 502d. Earlier that evening: one wal_insert_begin
+failed at 22:48, and one FATAL at 22:53 "app did not become
+healthy within 60s; not starting nginx" followed by a restart
+and clean boot at 22:53:35. Periodic HEAD / 501s from Render's
+health checker (expected: HEAD is not implemented by the app).
+
+### Root cause (proven in dev, not guessed)
+Concurrent write transactions on the libSQL embedded replica
+serialize catastrophically. Measured against a local sqld
+primary with libsql-experimental 0.0.55 (the exact live
+driver): 10 threads x 5 connect + BEGIN IMMEDIATE + INSERT +
+SELECT + commit took 220.2s, only 11 of 50 succeeded, 39
+failed with 'Remote SQlite failure: 2:0:Transaction timed-out'
+(5s/15s), one op taking 115s — while the identical read-only
+workload took 0.1s with 0 errors, and the identical workload
+against plain sqlite3 took 0.1s. The replica forwards writes
+to the primary, the primary allows one write transaction at a
+time with a ~5s budget, and queued write transactions burn
+that budget while waiting, then fail, and the app retries them,
+re-queueing. Every page view is a write transaction
+(rate_limit() BEGIN IMMEDIATE + page_views INSERT + session
+touch UPDATEs), so even a couple of simultaneous visitors wedge
+the site: requests hang past nginx's 60s read timeout and
+Render answers 502, while /healthz (read-only, fast) stays
+green, so start.sh and Render both think the app is healthy.
+The queue eventually drains, one request gets through, the
+next batch re-wedges it. That is the load-once-then-502 cycle.
+Hypotheses ruled out in dev: connection leak (dropped libSQL
+connections ARE freed — 0 leaked FDs / 1 thread after 50
+cycles, with and without sync_interval), process death / OOM
+(app stayed alive at ~52 MB RSS through the wedge; it
+recovered on its own), nginx dying (start.sh wait -n would
+have restarted the container — no restart happened during the
+repro wedge), BrokenPipe (handled in Update 15).
+
+### What changed (all in ~/workspace/network-merge/dev/)
+- db_backend.py 671 -> 772 lines (pre-change kept as
+  db_backend.py.bak-flap16): single-writer lock. A module-level
+  threading.RLock (_WRITE_LOCK, 10s timeout); _Connection
+  acquires it on the first write statement (INSERT / UPDATE /
+  DELETE / REPLACE / BEGIN / CREATE / DROP / ALTER / TRUNCATE /
+  REINDEX / VACUUM, via _is_write_sql) and holds it until the
+  transaction ends (commit / rollback / close, released in a
+  finally so a dropped connection can never wedge writers).
+  Reads never take the lock, so reads stay concurrent and fast.
+  A waiter that times out raises sqlite3.Error containing
+  'locked', so rate_limit() treats it as transient and falls
+  back to in-memory counters, and other writers fail honestly
+  with a 500 instead of hanging 115s and 502ing everyone. The
+  app never uses raw cursors, so the _Connection hooks cover
+  every write path. Local/plain-sqlite mode is unaffected
+  (it does not use this wrapper).
+- start.sh 66 -> 76 lines (pre-change kept as
+  start.sh.bak-flap16): health gate raised from 60s (120
+  attempts) to 120s (240 attempts). A cold start has to pull
+  the replica across the Pacific (Oregon -> Sydney) plus
+  init_db/quick_check, and live proved 60s can kill a
+  healthy-but-slow start (FATAL 22:53, clean boot 35s later).
+- New flap_test.py (314 lines, 26 checks): write/read
+  classification, lock-timeout fails fast with a 'locked'
+  error and succeeds after release, failed write releases
+  the lock, and — when a sync primary is reachable at
+  QUAD_SQLD_URL (default http://127.0.0.1:8080) — 8 threads x
+  5 concurrent BEGIN IMMEDIATE write transactions all succeed
+  in under 60s, and 10 x 5 concurrent reads all succeed in
+  under 10s. Remote tests skip (not fail) with no sqld.
+  Note for the test runner: local sqld <= 0.24.32 rejects
+  PRAGMA busy_timeout/synchronous/wal_checkpoint on a replica
+  ('unsupported statement'); Turso cloud accepts them (live
+  serves pages — connect_turso would raise on every connect
+  otherwise). flap_test tolerates those pragmas test-only.
+
+### Verification (dev, local sqld primary)
+- Raw driver, pre-fix: 220.2s, 11/50 writes ok. Post-fix
+  (flap_test remote): 40/40 writes ok in 0.8s; reads 50/50.
+- Full app server, Turso mode, pre-fix hammer (10 threads x
+  5 mixed requests): 35.5s, 19/20 /login+/explore timeouts,
+  then GET / timed out; process stayed alive and recovered.
+  Post-fix hammer, same script: 0.9s, all 50 requests 200,
+  GET / 200 in 0.02s after the burst, 0 tracebacks / FATAL /
+  malformed / wal errors in the log. Plain-sqlite control was
+  0.1s throughout (the wedge is Turso-path only).
+- Full suite re-run: smoke PASS; merge 51, auth 25, security
+  84, fix 32, listening 44, top5 78, forgot 45, failover 31,
+  pythonanywhere 12, render_free 30, object_storage 68, wal502
+  20, malformed502 25, fixall 23, flap 26 — 594 checks +
+  smoke PASS, 0 failed. Backup zip md5 re-verified unchanged:
+  aae87ec977f13b371de50aedb192cd96. No branding, features,
+  routes, or auth behaviour changed when healthy. No payment,
+  no credentials.
+
+### Remaining risks / honest limits
+- Real Turso cloud sync + a real Render spin-down still cannot
+  be tested in dev; the first live restart is the true proof.
+  Watch the first minutes of live logs for 'Transaction
+  timed-out', 'database write lock timed out', and for page
+  latency: each request still opens ~5 fresh libSQL
+  connections, each doing a handshake with Turso Sydney
+  (~0.2-1s each cross-Pacific), so a page view can take
+  several seconds live even when nothing is wedged. If live
+  pages stay slow, the next step is a per-thread connection
+  cache (not built here — stale connections after a rebuild
+  make it riskier than the lock).
+- A rebuild from Turso still loses writes that only lived in
+  the local WAL/file (inherent to the replica design).
+- The write lock serialises all writers: under a genuine burst
+  of many simultaneous posters, later writers wait up to 10s
+  and then fail honestly (500 / rate-limit fallback) instead of
+  hanging. For a friends-scale site this is the right trade.
+- HEAD / 501s from Render's health checker are expected and
+  harmless (the app does not implement HEAD).
+
+### To deploy after Mitchell approves
+- Upload to GitHub (new staging dir, e.g. `upload9/`), then
+  redeploy the-quad-free on Render (auto-deploy on commit
+  should trigger; verify manually if it does not). No env var
+  or secret changes. After deploy, verify: GET / 200, /healthz
+  ok, then RE-RUN the full dummy-account live test from
+  scratch (create 'Sydney Test', post, log out/in, delete it,
+  confirm it cannot log in again — the previous dummy account
+  is unconfirmed), including a recovery-code reset, and hit
+  /register twice in a row quickly (the exact sequence that
+  502d before). Then let the instance sleep and check GET /
+  still returns 200 after it wakes.

@@ -23,13 +23,23 @@ APP_PID=$!
 # so Render restarts the container instead of serving 502s.
 # Update 15: the loop above used to fall through and start
 # nginx even when the app NEVER became healthy within the
-# wait (120 attempts, no healthy flag) — exactly the
+# wait (240 attempts, no healthy flag) — exactly the
 # connection-refused state it was meant to prevent, just 60
 # seconds later. Now it exits if the app is not healthy by
 # the end of the wait, so Render restarts the container and
 # the log says why, instead of serving 502s indefinitely.
 healthy=0
-for _ in $(seq 1 120); do
+# Update 16: 240 attempts x 0.5s = 120s, not 60s. A cold start
+# on Render free has to pull the Turso replica across the
+# Pacific (Oregon -> Sydney) plus run init_db/quick_check, and
+# live on 2026-11-19 the app was killed by this gate at 60s
+# ('FATAL: app did not become healthy within 60s') even though
+# the very next boot came up clean in 35s — the gate was
+# killing a healthy-but-slow start and burning another full
+# cold start. 120s still bounds a genuinely dead app; a
+# container that cannot answer /healthz in two minutes is
+# restarted either way.
+for _ in $(seq 1 240); do
   if ! kill -0 "$APP_PID" 2>/dev/null; then
     echo 'FATAL: app process exited before becoming healthy; not starting nginx.' >&2
     wait "$APP_PID" 2>/dev/null || true
