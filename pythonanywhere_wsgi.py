@@ -1,4 +1,4 @@
-"""The Quad on PythonAnywhere (free Beginner account) — WSGI adapter.
+"""The Campus on PythonAnywhere (free Beginner account) — WSGI adapter.
 
 Why this file exists
 --------------------
@@ -160,7 +160,7 @@ def application(environ, start_response):
     try:
         port = _start_backend()
     except Exception as exc:  # backend could not start: fail loudly
-        body = ('The Quad backend could not start: %s' % exc).encode('utf-8')
+        body = ('The Campus backend could not start: %s' % exc).encode('utf-8')
         start_response('502 Bad Gateway', [
             ('Content-Type', 'text/plain; charset=utf-8'),
             ('Content-Length', str(len(body))),
@@ -207,7 +207,7 @@ def application(environ, start_response):
                        if k.lower() not in _HOP_BY_HOP]
         conn.close()
     except Exception as exc:
-        body = ('The Quad backend is unavailable: %s' % exc).encode('utf-8')
+        body = ('The Campus backend is unavailable: %s' % exc).encode('utf-8')
         start_response('502 Bad Gateway', [
             ('Content-Type', 'text/plain; charset=utf-8'),
             ('Content-Length', str(len(body))),

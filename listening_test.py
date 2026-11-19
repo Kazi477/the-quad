@@ -15,7 +15,7 @@ Covers:
  9. Profile + feed display (stories bubble, Now listening sidebar)
 10. Spotify track on a post (link + embed), invalid post link rejected
 11. /notes/refresh stub says live sync is NOT set up, fakes nothing
-12. CSP frame-src allows open.spotify.com; Quad Radio still works
+12. CSP frame-src allows open.spotify.com; Campus Radio still works
 """
 import http.cookiejar, importlib.util, os, re, shutil, sqlite3, subprocess, sys, tempfile, time, urllib.parse, urllib.request, urllib.error
 from pathlib import Path
@@ -314,11 +314,11 @@ try:
     check('CSP still has script-src self, no unsafe-inline',
           "script-src 'self';" in h.get('Content-Security-Policy', '') and 'unsafe-inline' not in h.get('Content-Security-Policy', ''), '')
     st, _, page = get(owner, '/')
-    check('composer still offers Quad Radio + Spotify field',
-          'Quad Radio' in page and 'spotify_link' in page and 'music_track' in page, '')
+    check('composer still offers Campus Radio + Spotify field',
+          'Campus Radio' in page and 'spotify_link' in page and 'music_track' in page, '')
     st, _, _ = post(owner, '/posts', {'csrf': csrf(page), 'body': 'quad radio still works', 'music_track': 'quad-dawn'})
     st, _, page = get(owner, '/')
-    check('Quad Radio post still renders', 'quad radio still works' in page and 'Quad Radio · Dawn Loop' in page, '')
+    check('Campus Radio post still renders', 'quad radio still works' in page and 'Campus Radio · Dawn Loop' in page, '')
     st, _, css = get(owner, '/app.css')
     check('listening-note CSS classes served', '.note-bubble' in css and '.spotify-embed' in css, '')
 except Exception:

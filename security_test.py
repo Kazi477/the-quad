@@ -1,4 +1,4 @@
-"""Dev-only adversarial security test for The Quad.
+"""Dev-only adversarial security test for The Campus.
 NOT part of the production bundle (Dockerfile copies only the_network_production.py).
 Run: python3 security_test.py   (from this folder)
 
@@ -200,7 +200,7 @@ try:
     # Logout invalidates the session.
     st, _, _ = post(anon, '/logout', {'csrf': csrf(get(anon, '/')[2])})
     st, _, home = get(anon, '/')
-    check('logout returns to landing', 'Welcome to The Quad' in home and 'Welcome, Owner' not in home)
+    check('logout returns to landing', 'Welcome to The Campus' in home and 'Welcome, Owner' not in home)
     st, _, _ = post(anon, '/posts', {'csrf': 'stale', 'body': 'after logout'})
     check('logged-out post is rejected', st == 403, str(st))
     # CSRF: missing / wrong / another user's token must all fail.
@@ -367,10 +367,10 @@ try:
     check('no fixed desktop-only widths in CSS',
           'max-width:1160px' in css and re.search(r'min-width:\s*[1-9]\d{2,}px', css) is None)
     st, _, feed = get(client(), '/', headers=owner_h)
-    check('Quad Radio labelled as built-in synth loops', 'built-in synth loops' in feed, '')
+    check('Campus Radio labelled as built-in synth loops', 'built-in synth loops' in feed, '')
     st, _, _ = post(client(), '/posts', {'csrf': owner_csrf, 'body': 'music label test post', 'music_track': 'quad-dawn'}, headers=owner_h)
     st, _, feed = get(client(), '/', headers=owner_h)
-    check('music post bar labelled built-in loop', 'built-in loop' in feed and 'Quad Radio · Dawn Loop' in feed, '')
+    check('music post bar labelled built-in loop', 'built-in loop' in feed and 'Campus Radio · Dawn Loop' in feed, '')
     st, _, admin = get(client(), '/admin', headers=owner_h)
     check('Traffic Shield labels Nginx as configured, not measured',
           'Nginx level (configured, not measured)' in admin and '20 requests/second' in admin, '')

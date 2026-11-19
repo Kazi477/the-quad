@@ -1,4 +1,4 @@
-# The Quad on PythonAnywhere (free Beginner account) — setup guide
+# The Campus on PythonAnywhere (free Beginner account) — setup guide
 
 **Account:** username `mitchellwhite`, site `https://mitchellwhite.pythonanywhere.com`
 **Status:** DEV ONLY preparation. Nothing here has been deployed to
@@ -75,7 +75,7 @@ packages to install.
 6. **Reload** the web app (green **Reload** button on the Web tab).
    First load takes a few seconds while the loopback backend starts.
 7. **Check it:** open `https://mitchellwhite.pythonanywhere.com/`
-   — you should see The Quad landing page. Then
+   — you should see The Campus landing page. Then
    `https://mitchellwhite.pythonanywhere.com/healthz` should return
    `ok`. Register the first account with
    `mitchellwhite018@gmail.com` — that email is in the admin list, so

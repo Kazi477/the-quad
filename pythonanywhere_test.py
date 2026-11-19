@@ -122,7 +122,7 @@ def main():
 
         st, home = anon.get('/')
         check('landing page loads via WSGI',
-              st == 200 and 'The Quad' in home, 'status %s' % st)
+              st == 200 and 'The Campus' in home, 'status %s' % st)
 
         st, body = anon.post('/register', {
             'name': 'Mitchell', 'email': 'mitchellwhite018@gmail.com',

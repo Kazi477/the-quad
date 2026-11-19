@@ -1,4 +1,4 @@
-"""Database backend for The Quad — local SQLite or Turso (libSQL).
+"""Database backend for The Campus — local SQLite or Turso (libSQL).
 
 Default behaviour is unchanged: plain ``sqlite3`` on a local file
 (``DATA_DIR/network.db``), exactly as before. Nothing about the app

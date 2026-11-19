@@ -1,7 +1,7 @@
-"""The Quad (formerly The Network) — dev rename, 2026-11-19: single-file Python social app, Python 3.9+, standard library only.
-Quad design merged in dev only: teal modern styling, Nods, Quad Radio music (Web Audio, no external files),
+"""The Campus (formerly The Quad, originally The Network) — dev rename, 2026-11-19: single-file Python social app, Python 3.9+, standard library only.
+Campus design merged in dev only: teal modern styling, Nods, Campus Radio music (Web Audio, no external files),
 stories row, enhanced admin (Traffic Shield + Manage accounts), official /login and /register screens.
-User-facing branding is now "The Quad". Technical identifiers that would break existing accounts/deployments
+User-facing branding is now "The Campus". Technical identifiers that would break existing accounts/deployments
 are deliberately unchanged: SQLite file network.db, session cookie network_session, Render service name in
 render.yaml, and the admin/owner email list. No live deployment from this dev copy.
 
@@ -370,11 +370,11 @@ def escape_like(term):
     """Escape LIKE wildcards so a search term cannot act as a wildcard."""
     return term.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
 
-# Quad Radio: built-in Web Audio tracks only — no external audio files, no third-party hosts.
+# Campus Radio: built-in Web Audio tracks only — no external audio files, no third-party hosts.
 MUSIC_TRACKS = {
-    'quad-dawn': 'Quad Radio · Dawn Loop',
-    'quad-night': 'Quad Radio · Night Loop',
-    'quad-quad': 'Quad Radio · Quad Anthem',
+    'quad-dawn': 'Campus Radio · Dawn Loop',
+    'quad-night': 'Campus Radio · Night Loop',
+    'quad-quad': 'Campus Radio · Campus Anthem',
 }
 
 # Spotify Listening Notes (Instagram Notes-style, manual only for now).
@@ -586,37 +586,37 @@ def shell(title, content, user=None, error=''):
         ping = '<script src="/app.js" defer></script>'
     else:
         nav = '<a href="/login">Log in</a><a href="/register">Create account</a>'
-        footer = 'The Quad · An independent project. Not affiliated with Facebook or Meta.'
+        footer = 'The Campus · An independent project. Not affiliated with Facebook or Meta.'
         ping = ''
     err = '<div class="error">%s</div>' % esc(error) if error else ''
-    return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>%s · The Quad</title><link rel="stylesheet" href="/app.css"></head><body><header><a class="brand" href="/">the quad<span class="brand-dot">.</span></a><nav>%s</nav></header><main>%s%s<footer class="footer">%s</footer></main>%s</body></html>' % (esc(title), nav, err, content, footer, ping)
+    return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>%s · The Campus</title><link rel="stylesheet" href="/app.css"></head><body><header><a class="brand" href="/">the campus<span class="brand-dot">.</span></a><nav>%s</nav></header><main>%s%s<footer class="footer">%s</footer></main>%s</body></html>' % (esc(title), nav, err, content, footer, ping)
 
 
 
 def login_page(error='', email=''):
-    content = ('<div class="auth-wrap"><section class="card auth-hero"><span class="eyebrow">The Quad</span>'
-        '<h1>Started in a dorm room. Now it\'s the whole quad.</h1>'
+    content = ('<div class="auth-wrap"><section class="card auth-hero"><span class="eyebrow">The Campus</span>'
+        '<h1>Started in a dorm room. Now it\'s the whole campus.</h1>'
         '<p>Your people, your posts, your music — all in one place.</p>'
         '<ul><li><span>●</span> Post, Nod and comment with your circle</li>'
-        '<li><span>●</span> Message friends and share Quad Radio tracks</li>'
+        '<li><span>●</span> Message friends and share Campus Radio tracks</li>'
         '<li><span>●</span> Your account, your posts — delete what\'s yours</li></ul></section>'
-        '<section class="card auth-card"><h2>Log in to The Quad</h2>'
+        '<section class="card auth-card"><h2>Log in to The Campus</h2>'
         '<form method="post" action="/login" data-lock-submit="1">'
         '<label for="login-email">Email</label><input id="login-email" type="email" name="email" required maxlength="254" autocomplete="email" value="%s">'
         '<label for="login-password">Password</label><div class="password-wrap"><input id="login-password" type="password" name="password" required autocomplete="current-password"><button type="button" class="password-toggle" data-toggle-password="login-password">Show</button></div>'
         '<button class="btn" data-wait="Signing in…">Log in</button></form>'
         '<p class="auth-switch"><a href="/forgot-password">Forgot password?</a></p>'
-        '<p class="auth-switch">New to The Quad? <a href="/register">Create an account</a></p>'
+        '<p class="auth-switch">New to The Campus? <a href="/register">Create an account</a></p>'
         '<p class="small auth-note">Sessions last up to 7 days and sign you out after 24 hours idle.</p></section></div>') % esc(email)
     return shell('Log in', content, error=error)
 
 
 def register_page(error='', name='', email=''):
-    content = ('<div class="auth-wrap"><section class="card auth-hero"><span class="eyebrow">The Quad</span>'
-        '<h1>Join The Quad.</h1>'
+    content = ('<div class="auth-wrap"><section class="card auth-hero"><span class="eyebrow">The Campus</span>'
+        '<h1>Join The Campus.</h1>'
         '<p>Your people, your posts, your music — all in one place.</p>'
         '<ul><li><span>●</span> Post, Nod and comment with your circle</li>'
-        '<li><span>●</span> Message friends and share Quad Radio tracks</li>'
+        '<li><span>●</span> Message friends and share Campus Radio tracks</li>'
         '<li><span>●</span> Private accounts, blocks and your own admin-protected space</li></ul></section>'
         '<section class="card auth-card"><h2>Create your account</h2>'
         '<form method="post" action="/register" data-lock-submit="1">'
@@ -634,7 +634,7 @@ def register_page(error='', name='', email=''):
 def change_password_page(user, error='', forced=False):
     notice = ''
     if forced:
-        notice = '<p class="notice"><b>Your password needs updating.</b> It was set under an older password rule, or it is too weak under the current rule. Choose a new password (12+ characters, at least two kinds of characters, not a common password) to keep using The Quad. You cannot use the rest of the site until this is done.</p>'
+        notice = '<p class="notice"><b>Your password needs updating.</b> It was set under an older password rule, or it is too weak under the current rule. Choose a new password (12+ characters, at least two kinds of characters, not a common password) to keep using The Campus. You cannot use the rest of the site until this is done.</p>'
     content = ('<section class="card"><h1>Change your password</h1>%s'
         '<form method="post" action="/change-password">%s'
         '<label for="current-password">Current password</label><input id="current-password" type="password" name="current_password" required autocomplete="current-password">'
@@ -787,10 +787,10 @@ def send_reset_email(recipient, code):
         port=int(os.environ.get('SMTP_PORT','587'))
         timeout=10
         message=EmailMessage()
-        message['Subject']='Your The Quad password reset code'
+        message['Subject']='Your The Campus password reset code'
         message['From']=sender
         message['To']=recipient
-        message.set_content('Your The Quad password reset code is: %s\n\nIt expires in 10 minutes and can be used once. If you did not request it, ignore this email.'%code)
+        message.set_content('Your The Campus password reset code is: %s\n\nIt expires in 10 minutes and can be used once. If you did not request it, ignore this email.'%code)
         use_ssl=os.environ.get('SMTP_USE_SSL','').strip().lower() in ('1','true','yes')
         client=smtplib.SMTP_SSL(host,port,timeout=timeout,context=ssl.create_default_context()) if use_ssl else smtplib.SMTP(host,port,timeout=timeout)
         with client:
@@ -870,7 +870,7 @@ def consume_recovery_code(c, user_id, raw):
 
 REGISTRATION_NOTICE = ('<section class="card"><h1>Thanks — check your next step</h1>'
     '<p>If this email is new here, your account is ready. If you already have an account with this email, no new account was created.</p>'
-    '<p><a class="btn" href="/">Continue to The Quad</a></p>'
+    '<p><a class="btn" href="/">Continue to The Campus</a></p>'
     '<p>Try <a href="/login">signing in</a>, or use <a href="/forgot-password">Forgot password</a> to reset it.</p></section>')
 
 
@@ -930,7 +930,7 @@ def restore_stored_file(key, storage):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version='TheQuad'
+    server_version='TheCampus'
     sys_version=''
     def setup(self):
         super().setup()
@@ -1042,7 +1042,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.html(change_password_page(user, forced=bool(user['must_change_password'])))
         if path in ('/app.js','/activity.js'):
             js="""(()=>{const csrf=()=>document.querySelector('[name=csrf]')?.value||'';const ping=()=>{if(document.visibilityState==='visible'&&csrf())fetch('/activity',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'csrf='+encodeURIComponent(csrf())}).catch(()=>{});};if(csrf()){ping();setInterval(ping,30000);document.addEventListener('visibilitychange',ping)}document.addEventListener('submit',e=>{const f=e.target;if(!(f instanceof HTMLFormElement))return;const msg=f.dataset.confirm;if(msg&&!confirm(msg)){e.preventDefault();return}if(f.dataset.videoForm==='1'&&!f.dataset.videoChecked){const file=f.querySelector('input[type=file][name=media]')?.files?.[0];if(file&&file.type.startsWith('video/')){e.preventDefault();const v=document.createElement('video');v.preload='metadata';v.onloadedmetadata=()=>{URL.revokeObjectURL(v.src);if(!v.duration||v.duration>30){alert('Videos must be 30 seconds or shorter.');return}const d=f.querySelector('[name=duration_ms]');if(d)d.value=Math.round(v.duration*1000);f.dataset.videoChecked='1';f.requestSubmit()};v.onerror=()=>alert('Could not read this video.');v.src=URL.createObjectURL(file);return}}if(f.dataset.lockSubmit==='1'){const b=f.querySelector('button[type=submit],button:not([type])');if(b){b.disabled=true;b.textContent=b.dataset.wait||'Working…'}}})
-(()=>{const TRACKS={'quad-dawn':{label:'Quad Radio · Dawn Loop',notes:[[523.25,.5],[587.33,.5],[659.25,.5],[783.99,1],[659.25,.5],[587.33,1]]},'quad-night':{label:'Quad Radio · Night Loop',notes:[[440,.5],[523.25,.5],[415.3,.5],[392,1],[329.63,.5],[440,1]]},'quad-quad':{label:'Quad Radio · Quad Anthem',notes:[[659.25,.25],[783.99,.25],[880,.5],[783.99,.25],[659.25,.25],[587.33,1]]}};let ctx=null,playing=null,timers=[];const stop=()=>{timers.forEach(clearTimeout);timers=[];if(ctx){ctx.close().catch(()=>{});ctx=null}if(playing){playing.textContent=playing.dataset.label||'▶ Play';playing=null}};const play=(name,btn)=>{if(playing===btn){stop();return}stop();const t=TRACKS[name];if(!t)return;ctx=new (window.AudioContext||window.webkitAudioContext)();playing=btn;btn.dataset.label=btn.textContent;btn.textContent='■ Stop';let when=ctx.currentTime+.05;t.notes.forEach(([f,d])=>{const o=ctx.createOscillator(),g=ctx.createGain();o.type='triangle';o.frequency.value=f;g.gain.setValueAtTime(0,when);g.gain.linearRampToValueAtTime(.12,when+.03);g.gain.exponentialRampToValueAtTime(.001,when+d*.9);o.connect(g);g.connect(ctx.destination);o.start(when);o.stop(when+d);when+=d});timers.push(setTimeout(stop,Math.max(1000,(when-ctx.currentTime)*1000)))};document.addEventListener('click',e=>{const b=e.target.closest('[data-quad-track]');if(!b)return;e.preventDefault();play(b.dataset.quadTrack,b)});})();(()=>{document.addEventListener('click',e=>{const b=e.target.closest('[data-toggle-password]');if(!b)return;const f=document.getElementById(b.dataset.togglePassword);if(!f)return;const show=f.type==='password';f.type=show?'text':'password';b.textContent=show?'Hide':'Show';f.focus()});const pw=document.getElementById('register-password')||document.getElementById('new-password');const bar=document.getElementById('pw-meter-bar');const hint=document.getElementById('pw-hint');if(pw&&bar){const upd=()=>{const v=pw.value;let s=0;if(v.length>=12)s+=40;else s+=Math.min(40,v.length*3);if(/[a-z]/.test(v)&&/[A-Z]/.test(v))s+=20;if(/\\d/.test(v))s+=20;if(/[^A-Za-z0-9]/.test(v))s+=20;bar.style.width=Math.min(100,s)+'%';if(hint)hint.textContent=v.length<12?'Use 12+ characters — a phrase you can remember works well.':s<60?'Good — longer or more varied is stronger.':s<90?'Strong password.':'Great — that looks strong.'};pw.addEventListener('input',upd);upd()}})();
+(()=>{const TRACKS={'quad-dawn':{label:'Campus Radio · Dawn Loop',notes:[[523.25,.5],[587.33,.5],[659.25,.5],[783.99,1],[659.25,.5],[587.33,1]]},'quad-night':{label:'Campus Radio · Night Loop',notes:[[440,.5],[523.25,.5],[415.3,.5],[392,1],[329.63,.5],[440,1]]},'quad-quad':{label:'Campus Radio · Campus Anthem',notes:[[659.25,.25],[783.99,.25],[880,.5],[783.99,.25],[659.25,.25],[587.33,1]]}};let ctx=null,playing=null,timers=[];const stop=()=>{timers.forEach(clearTimeout);timers=[];if(ctx){ctx.close().catch(()=>{});ctx=null}if(playing){playing.textContent=playing.dataset.label||'▶ Play';playing=null}};const play=(name,btn)=>{if(playing===btn){stop();return}stop();const t=TRACKS[name];if(!t)return;ctx=new (window.AudioContext||window.webkitAudioContext)();playing=btn;btn.dataset.label=btn.textContent;btn.textContent='■ Stop';let when=ctx.currentTime+.05;t.notes.forEach(([f,d])=>{const o=ctx.createOscillator(),g=ctx.createGain();o.type='triangle';o.frequency.value=f;g.gain.setValueAtTime(0,when);g.gain.linearRampToValueAtTime(.12,when+.03);g.gain.exponentialRampToValueAtTime(.001,when+d*.9);o.connect(g);g.connect(ctx.destination);o.start(when);o.stop(when+d);when+=d});timers.push(setTimeout(stop,Math.max(1000,(when-ctx.currentTime)*1000)))};document.addEventListener('click',e=>{const b=e.target.closest('[data-quad-track]');if(!b)return;e.preventDefault();play(b.dataset.quadTrack,b)});})();(()=>{document.addEventListener('click',e=>{const b=e.target.closest('[data-toggle-password]');if(!b)return;const f=document.getElementById(b.dataset.togglePassword);if(!f)return;const show=f.type==='password';f.type=show?'text':'password';b.textContent=show?'Hide':'Show';f.focus()});const pw=document.getElementById('register-password')||document.getElementById('new-password');const bar=document.getElementById('pw-meter-bar');const hint=document.getElementById('pw-hint');if(pw&&bar){const upd=()=>{const v=pw.value;let s=0;if(v.length>=12)s+=40;else s+=Math.min(40,v.length*3);if(/[a-z]/.test(v)&&/[A-Z]/.test(v))s+=20;if(/\\d/.test(v))s+=20;if(/[^A-Za-z0-9]/.test(v))s+=20;bar.style.width=Math.min(100,s)+'%';if(hint)hint.textContent=v.length<12?'Use 12+ characters — a phrase you can remember works well.':s<60?'Good — longer or more varied is stronger.':s<90?'Strong password.':'Great — that looks strong.'};pw.addEventListener('input',upd);upd()}})();
 })();"""
             body=js.encode('utf-8');self.send_response(200);self.send_header('Content-Type','application/javascript; charset=utf-8');self.send_header('Content-Length',str(len(body)));self.security_headers('private, max-age=300');self.end_headers();self.wfile.write(body);return
         if path.startswith('/media/'):
@@ -1084,7 +1084,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.html(register_page())
         if path=='/forgot-password':return self.forgot_password_page()
         if not user:
-            content='''<div class="auth-wrap"><section class="card auth-hero"><span class="eyebrow">The Quad</span><h1>Started in a dorm room. Now it\'s the whole quad.</h1><p>Your people, your posts, your music — all in one place.</p><ul><li><span>●</span> Post, Nod and comment with your circle</li><li><span>●</span> Message friends and share Quad Radio tracks</li><li><span>●</span> Your account, your posts — delete what\'s yours</li></ul></section><section class="card auth-card"><h2>Welcome to The Quad</h2><p>Log in to your account, or create one to join.</p><a class="btn" href="/login">Log in</a> <a class="btn light" href="/register">Create account</a><p class="auth-switch"><a href="/forgot-password">Forgot password?</a></p></section></div>'''
+            content='''<div class="auth-wrap"><section class="card auth-hero"><span class="eyebrow">The Campus</span><h1>Started in a dorm room. Now it\'s the whole campus.</h1><p>Your people, your posts, your music — all in one place.</p><ul><li><span>●</span> Post, Nod and comment with your circle</li><li><span>●</span> Message friends and share Campus Radio tracks</li><li><span>●</span> Your account, your posts — delete what\'s yours</li></ul></section><section class="card auth-card"><h2>Welcome to The Campus</h2><p>Log in to your account, or create one to join.</p><a class="btn" href="/login">Log in</a> <a class="btn light" href="/register">Create account</a><p class="auth-switch"><a href="/forgot-password">Forgot password?</a></p></section></div>'''
             self.html(shell('Welcome',content));return
         # last_seen was updated alongside page-view logging above.
         if path=='/':
@@ -1176,7 +1176,7 @@ class Handler(BaseHTTPRequestHandler):
             note_rows=c.execute("SELECT * FROM listening_notes WHERE expires_at>? AND (user_id=? OR user_id IN (SELECT CASE WHEN f.requester_id=? THEN f.addressee_id ELSE f.requester_id END FROM friendships f WHERE (f.requester_id=? OR f.addressee_id=?) AND f.status='accepted'))",(time.time(),user['id'],user['id'],user['id'],user['id'])).fetchall()
             notes_by_user={r['user_id']:r for r in note_rows}
             own_note=notes_by_user.get(user['id'])
-        content='<section class="card quad-hero"><span class="eyebrow">The Quad</span><h2>Started in a dorm room. Now it\'s the whole quad.</h2><p>Your people, your posts, your music — all in one place on The Quad.</p></section><h1>Welcome, %s</h1>'%esc(display(user))
+        content='<section class="card quad-hero"><span class="eyebrow">The Campus</span><h2>Started in a dorm room. Now it\'s the whole campus.</h2><p>Your people, your posts, your music — all in one place on The Campus.</p></section><h1>Welcome, %s</h1>'%esc(display(user))
         # One-time nudge (Update 7): recovery codes only help if the user
         # created them while signed in. Shown only to the owner, on the
         # first page of their own feed, until they have at least one.
@@ -1184,21 +1184,21 @@ class Handler(BaseHTTPRequestHandler):
             if page==0 and count_unused_recovery_codes(_c,user['id'])==0:
                 content+='<section class="card notice"><b>Save your recovery codes.</b> If you forget your password, a recovery code gets you back in — no email needed. It takes a minute in <a href="/settings">Settings → Password recovery</a>.</section>'
         if stories:
-            content+='<section class="card"><h2>Quad moments</h2><div class="story-row">'
+            content+='<section class="card"><h2>Campus Moments</h2><div class="story-row">'
             for s in stories:
                 snote=notes_by_user.get(s['id'])
                 bubble='<span class="note-bubble">♫ %s</span>' % esc(snote['track_title']) if snote else ''
                 content+='<a class="story" href="/member/%s">%s%s<span>%s</span></a>'%(s['id'],bubble,avatar(s,64),esc(display(s)))
             content+='</div></section>'
         else:
-            content+='<section class="card"><h2>Quad moments</h2><p class="small">No moments yet — share the first post and it will show here.</p></section>'
+            content+='<section class="card"><h2>Campus Moments</h2><p class="small">No moments yet — share the first post and it will show here.</p></section>'
         if incoming:
             content+='<section class="card notice"><h2>Friend requests · %s</h2><p>These people want to connect with you.</p>'%len(incoming)
             for m in incoming:
                 content+='<div class="person">%s<b class="grow">%s</b><form method="post" action="/friend">%s<input type="hidden" name="user_id" value="%s"><input type="hidden" name="action" value="accept"><button>Accept</button></form><form method="post" action="/friend">%s<input type="hidden" name="user_id" value="%s"><input type="hidden" name="action" value="decline"><button class="light">Decline</button></form></div>'%(avatar(m),esc(display(m)),form_csrf(user),m['user_id'],form_csrf(user),m['user_id'])
             content+='</section>'
         content+=listening_note_form(user, own_note)
-        content+='<section class="card"><h2>Share a post</h2><form method="post" action="/posts" enctype="multipart/form-data" data-video-form="1">%s<textarea name="body" maxlength="2000" placeholder="What’s on your mind? #hashtags welcome"></textarea><label>Add a photo or video (videos up to 30 seconds)</label><input type="file" name="media" accept="image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm"><label>Attach Quad Radio music (optional) — built-in synth loops, not real songs</label><select name="music_track"><option value="">No music</option><option value="quad-dawn">Quad Radio · Dawn Loop</option><option value="quad-night">Quad Radio · Night Loop</option><option value="quad-quad">Quad Radio · Quad Anthem</option></select><label>Attach a Spotify track (optional) — paste a Spotify track link to show a link and preview player on your post</label><input name="spotify_link" maxlength="300" placeholder="https://open.spotify.com/track/..."><div class="music-bar"><span class="small grow">Preview Quad Radio:</span><button type="button" data-quad-track="quad-dawn">▶ Dawn</button><button type="button" data-quad-track="quad-night">▶ Night</button><button type="button" data-quad-track="quad-quad">▶ Anthem</button></div><input type="hidden" name="duration_ms" value=""><button class="btn">Share post</button></form></section><div class="row"><h2 class="grow">Your feed</h2><form method="get"><select name="feed"><option value="all" %s>Everyone</option><option value="following" %s>Friends only</option></select><select name="sort"><option value="newest" %s>Newest</option><option value="oldest" %s>Oldest</option><option value="liked" %s>Most nodded</option></select><button class="light">Sort</button></form></div><p class="small"><a href="/explore">Explore trending &amp; hashtags</a> · <a href="/saved">Saved posts</a></p>'%(form_csrf(user),'selected' if feed_mode=='all' else '','selected' if feed_mode=='following' else '','selected' if sort=='newest' else '','selected' if sort=='oldest' else '','selected' if sort=='liked' else '')
+        content+='<section class="card"><h2>Share a post</h2><form method="post" action="/posts" enctype="multipart/form-data" data-video-form="1">%s<textarea name="body" maxlength="2000" placeholder="What’s on your mind? #hashtags welcome"></textarea><label>Add a photo or video (videos up to 30 seconds)</label><input type="file" name="media" accept="image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm"><label>Attach Campus Radio music (optional) — built-in synth loops, not real songs</label><select name="music_track"><option value="">No music</option><option value="quad-dawn">Campus Radio · Dawn Loop</option><option value="quad-night">Campus Radio · Night Loop</option><option value="quad-quad">Campus Radio · Campus Anthem</option></select><label>Attach a Spotify track (optional) — paste a Spotify track link to show a link and preview player on your post</label><input name="spotify_link" maxlength="300" placeholder="https://open.spotify.com/track/..."><div class="music-bar"><span class="small grow">Preview Campus Radio:</span><button type="button" data-quad-track="quad-dawn">▶ Dawn</button><button type="button" data-quad-track="quad-night">▶ Night</button><button type="button" data-quad-track="quad-quad">▶ Anthem</button></div><input type="hidden" name="duration_ms" value=""><button class="btn">Share post</button></form></section><div class="row"><h2 class="grow">Your feed</h2><form method="get"><select name="feed"><option value="all" %s>Everyone</option><option value="following" %s>Friends only</option></select><select name="sort"><option value="newest" %s>Newest</option><option value="oldest" %s>Oldest</option><option value="liked" %s>Most nodded</option></select><button class="light">Sort</button></form></div><p class="small"><a href="/explore">Explore trending &amp; hashtags</a> · <a href="/saved">Saved posts</a></p>'%(form_csrf(user),'selected' if feed_mode=='all' else '','selected' if feed_mode=='following' else '','selected' if sort=='newest' else '','selected' if sort=='oldest' else '','selected' if sort=='liked' else '')
         if not posts and page==0: content+='<section class="card">No posts yet. Find people or write the first post.</section>'
         for p in posts:
             content+='<article class="card"><div class="row">%s<div class="grow"><a href="/member/%s"><b>%s</b></a><time>%s</time></div>'%(avatar(p),p['user_id'],esc(display(p)),esc(date(p['created'])))
@@ -1303,7 +1303,7 @@ class Handler(BaseHTTPRequestHandler):
             tags=c.execute('''SELECT h.tag,COUNT(*) n FROM post_hashtags ph JOIN hashtags h ON h.id=ph.hashtag_id JOIN posts p ON p.id=ph.post_id WHERE p.created>? GROUP BY h.tag ORDER BY n DESC LIMIT 10''',(time.time()-7*86400,)).fetchall()
             suggested=c.execute('''SELECT u.* FROM users u WHERE u.id<>? AND u.id NOT IN (SELECT CASE WHEN f.requester_id=? THEN f.addressee_id ELSE f.requester_id END FROM friendships f WHERE (f.requester_id=? OR f.addressee_id=?) AND f.status='accepted') AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.blocker_id=? AND b.blocked_id=u.id) OR (b.blocker_id=u.id AND b.blocked_id=?)) ORDER BY u.last_seen DESC LIMIT 6''',(user['id'],user['id'],user['id'],user['id'],user['id'],user['id'])).fetchall()
             new_groups=c.execute('SELECT * FROM groups ORDER BY created DESC LIMIT 6').fetchall()
-        content='<section class="card quad-hero"><span class="eyebrow">Explore</span><h2>Around the Quad</h2><p>What is trending, what people are talking about, and who is new here.</p></section>'
+        content='<section class="card quad-hero"><span class="eyebrow">Explore</span><h2>Around the Campus</h2><p>What is trending, what people are talking about, and who is new here.</p></section>'
         content+='<section class="card"><h2>Search posts &amp; people</h2><form method="get" action="/search"><input name="q" placeholder="Search posts, hashtags, people"><button class="btn">Search</button></form><p class="small">Search respects privacy — private posts never show to non-friends.</p></section>'
         content+='<section class="card"><h2>Trending hashtags</h2>'
         if tags:
@@ -1357,7 +1357,7 @@ class Handler(BaseHTTPRequestHandler):
         with connect() as c:
             groups=c.execute('SELECT g.*,(SELECT COUNT(*) FROM group_members m WHERE m.group_id=g.id AND m.status=\'accepted\') members FROM groups g ORDER BY g.created DESC').fetchall()
             mine={r['group_id']:r for r in c.execute('SELECT * FROM group_members WHERE user_id=?',(user['id'],)).fetchall()}
-        content='<section class="card"><h1>Groups</h1><p>A group is a Quad — a place for a specific circle of people. Public groups are open to everyone; private groups need a member to approve you.</p></section>'
+        content='<section class="card"><h1>Groups</h1><p>A group is a circle on The Campus — a place for a specific circle of people. Public groups are open to everyone; private groups need a member to approve you.</p></section>'
         content+='<section class="card"><h2>Create a group</h2><form method="post" action="/group">%s<label>Group name</label><input name="name" required maxlength="80" placeholder="e.g. Dorm 4B"><label>Description</label><textarea name="description" maxlength="500" placeholder="What is this group for?"></textarea><label>Visibility</label><select name="visibility"><option value="public">Public — anyone can join and see posts</option><option value="private">Private — members only, join by request</option></select><button class="btn">Create group</button></form></section>'%form_csrf(user)
         for g in groups:
             if g['visibility']=='private' and g['id'] not in mine and g['owner_id']!=user['id']:
@@ -1422,7 +1422,7 @@ class Handler(BaseHTTPRequestHandler):
             friends=c.execute("SELECT u.* FROM friendships f JOIN users u ON u.id=CASE WHEN f.requester_id=? THEN f.addressee_id ELSE f.requester_id END WHERE (f.requester_id=? OR f.addressee_id=?) AND f.status='accepted' ORDER BY u.display_name,u.name",(user['id'],user['id'],user['id'])).fetchall()
             rsvps={r['event_id']:r['status'] for r in c.execute('SELECT * FROM event_rsvps WHERE user_id=?',(user['id'],)).fetchall()}
         content='<section class="card"><h1>Events</h1><p>Upcoming events, with RSVPs and invitations to friends.</p></section>'
-        content+='<section class="card"><h2>Create an event</h2><form method="post" action="/event">%s<label>Title</label><input name="title" required maxlength="120"><label>Description</label><textarea name="description" maxlength="500"></textarea><label>When</label><input type="datetime-local" name="starts_at" required><label>Where</label><input name="location" maxlength="120" placeholder="e.g. The Quad, Dorm 4B"><label>Group (optional)</label><select name="group_id"><option value="">No group — open event</option>%s</select><button class="btn">Create event</button></form></section>'%(form_csrf(user),''.join('<option value="%s">%s</option>'%(g['id'],esc(g['name'])) for g in groups))
+        content+='<section class="card"><h2>Create an event</h2><form method="post" action="/event">%s<label>Title</label><input name="title" required maxlength="120"><label>Description</label><textarea name="description" maxlength="500"></textarea><label>When</label><input type="datetime-local" name="starts_at" required><label>Where</label><input name="location" maxlength="120" placeholder="e.g. The Campus, Dorm 4B"><label>Group (optional)</label><select name="group_id"><option value="">No group — open event</option>%s</select><button class="btn">Create event</button></form></section>'%(form_csrf(user),''.join('<option value="%s">%s</option>'%(g['id'],esc(g['name'])) for g in groups))
         for e in events:
             my=rsvps.get(e['id'],'')
             content+='<article class="card"><h2>%s</h2><p>%s</p><p class="small">%s · %s · by %s</p><p class="small">Your RSVP: <b>%s</b></p><form method="post" action="/event-rsvp">%s<input type="hidden" name="event_id" value="%s"><select name="status"><option value="going" %s>Going</option><option value="maybe" %s>Maybe</option><option value="not_going" %s>Not going</option></select><button class="light">Save RSVP</button></form>'%(esc(e['title']),esc(e['description']),esc(date(e['starts_at'])),esc(e['location']),esc(display(e)),esc(my or 'not set'),form_csrf(user),e['id'],'selected' if my=='going' else '','selected' if my=='maybe' else '','selected' if my=='not_going' else '')
@@ -1458,7 +1458,7 @@ class Handler(BaseHTTPRequestHandler):
                 'groups':[dict(r) for r in c.execute('SELECT g.* FROM groups g JOIN group_members m ON m.group_id=g.id WHERE m.user_id=?',(user['id'],)).fetchall()],
             }
         body=json.dumps(data,ensure_ascii=False,indent=2).encode('utf-8')
-        self.send_response(200);self.send_header('Content-Type','application/json; charset=utf-8');self.send_header('Content-Disposition','attachment; filename="the-quad-export.json"');self.send_header('Content-Length',str(len(body)));self.security_headers();self.end_headers();self.wfile.write(body)
+        self.send_response(200);self.send_header('Content-Type','application/json; charset=utf-8');self.send_header('Content-Disposition','attachment; filename="the-campus-export.json"');self.send_header('Content-Length',str(len(body)));self.security_headers();self.end_headers();self.wfile.write(body)
     def profile(self,user):
         with connect() as c:
             u=user_by_id(c,user['id'])
@@ -1533,7 +1533,7 @@ class Handler(BaseHTTPRequestHandler):
                      AND (COALESCE(u.bio,'') LIKE ? OR COALESCE(u.interests,'') LIKE ?)))
                 ORDER BY u.last_seen DESC LIMIT 60""",(user['id'],user['id'],user['id'],term,term,user['id'],user['id'],term,term)).fetchall()
             rels={r['id']:relationship(c,user['id'],r['id']) for r in rows}
-        content='<section class="card"><h1>Find people · Your Circle</h1><p>Add friends by name — send a request, accept, or remove them here in The Quad.</p><form method="get"><input name="q" value="%s" placeholder="Search names, bios or interests"><button class="btn">Search</button></form></section>'%esc(q)
+        content='<section class="card"><h1>Find people · Your Circle</h1><p>Add friends by name — send a request, accept, or remove them here in The Campus.</p><form method="get"><input name="q" value="%s" placeholder="Search names, bios or interests"><button class="btn">Search</button></form></section>'%esc(q)
         for m in rows:
             r=rels[m['id']];visible=not bool(m['private_account']) or bool(r and r['status']=='accepted')
             btn='<form method="post" action="/friend">%s<input type="hidden" name="user_id" value="%s"><input type="hidden" name="action" value="request"><button>Add friend</button></form>'%(form_csrf(user),m['id'])
@@ -1595,7 +1595,7 @@ class Handler(BaseHTTPRequestHandler):
             grouped.append(dict(n));grouped[-1]['count']=1;grouped[-1]['unread']=not n['read_at']
         for n in grouped:
             dest='/friends' if n['kind'] in ('friend_request','friend_accept') else ('/messages?with=%s'%n['actor_id'] if n['kind']=='message' else ('/post/%s'%esc(n['target_id']) if n['kind'] in ('like','comment','repost','reaction') and n['target_id'] and str(n['target_id']).isdigit() else ('/groups' if n['kind']=='group_invite' else ('/events' if n['kind'] in ('event_invite','event_reminder') else '/'))))
-            label='%s %s'%(esc(n['display_name'] or n['name'] or 'The Quad'),esc(n['body']))
+            label='%s %s'%(esc(n['display_name'] or n['name'] or 'The Campus'),esc(n['body']))
             if n['count']>1:
                 label+=' <span class="badge">×%s</span>'%n['count']
             content+='<a class="person %s" href="%s">%s<div><b>%s</b><time>%s</time></div></a>'%('unread' if n['unread'] else '',dest,avatar(n),label,esc(date(n['created'])))
@@ -1646,7 +1646,7 @@ class Handler(BaseHTTPRequestHandler):
         # VAPID keys and a push sender this server does not have.
         with connect() as _c:
             _prefs={r['kind']:r['enabled'] for r in _c.execute('SELECT kind,enabled FROM notification_prefs WHERE user_id=?',(user['id'],)).fetchall()}
-        content+='<section class="card"><h2>Notification preferences</h2><p class="small">Choose which in-app notifications you get. Push notifications are not available — The Quad does not have a push service set up.</p><form method="post" action="/notification-prefs">%s'%form_csrf(user)
+        content+='<section class="card"><h2>Notification preferences</h2><p class="small">Choose which in-app notifications you get. Push notifications are not available — The Campus does not have a push service set up.</p><form method="post" action="/notification-prefs">%s'%form_csrf(user)
         for _k in NOTIF_KINDS:
             _on=_prefs.get(_k,1)
             content+='<label class="row"><input type="checkbox" name="pref_%s"%s><span>%s</span></label>'%(_k,' checked' if _on else '',esc(_k.replace('_',' ')))
@@ -1656,7 +1656,7 @@ class Handler(BaseHTTPRequestHandler):
             content+='<section class="card"><h2>Delete my account</h2><p>Deleting your account removes your profile, posts, comments and messages. It is reversible for 30 days — an admin can restore it from the admin panel in that window. After 30 days the saved copy is deleted. To delete, type your email address and enter your current password.</p><form method="post" action="/account/delete" data-confirm="Delete your account? This can be restored by an admin for 30 days.">%s<label>Type your email to confirm</label><input type="email" name="confirm_email" required maxlength="254"><label>Current password</label><input type="password" name="password" required><button class="danger">Delete my account</button></form></section>'%form_csrf(user)
         else:
             content+='<section class="card"><h2>Delete my account</h2><p class="small">Admin accounts cannot be deleted here — another admin would need to remove the account from the admin panel.</p></section>'
-        content+='<section class="card"><h2>Spotify — live now-playing</h2><p><b>Live Spotify sync is not set up yet.</b> Your Listening Note is set by hand and lasts 24 hours — that works now, no Spotify account needed.</p><p>To show what you are actually listening to in real time, The Quad would need: a Spotify developer app configured on the server, each person linking their own Spotify account, and permission to read what they are currently playing (<code>user-read-currently-playing</code>). No Spotify tokens are stored by The Quad today, and nothing here claims to be connected.</p><p><a class="btn light" href="/notes/refresh">Check live now-playing status</a></p></section>'
+        content+='<section class="card"><h2>Spotify — live now-playing</h2><p><b>Live Spotify sync is not set up yet.</b> Your Listening Note is set by hand and lasts 24 hours — that works now, no Spotify account needed.</p><p>To show what you are actually listening to in real time, The Campus would need: a Spotify developer app configured on the server, each person linking their own Spotify account, and permission to read what they are currently playing (<code>user-read-currently-playing</code>). No Spotify tokens are stored by The Campus today, and nothing here claims to be connected.</p><p><a class="btn light" href="/notes/refresh">Check live now-playing status</a></p></section>'
         content+='<section class="card"><h2>Block someone</h2><form method="get" action="/people"><label>Find a member</label><input name="q" placeholder="Search by name"><button class="light">Open People</button></form></section>'
         return self.html(shell('Settings',content,user))
     def public_profile(self,user,key):
@@ -1699,7 +1699,7 @@ class Handler(BaseHTTPRequestHandler):
             shield=c.execute('SELECT action,COUNT(*) entries,SUM(request_count) total FROM rate_limits GROUP BY action ORDER BY total DESC LIMIT 10').fetchall()
             all_users=c.execute('SELECT id,name,display_name,email,is_admin,joined,last_seen FROM users ORDER BY joined LIMIT 100').fetchall()
         counts={r['hour_ago']:r['amount'] for r in hourly};peak=max(counts.values(),default=0)
-        content='<section class="card"><span class="eyebrow">PRIVATE ADMIN VIEW</span><h1>Admin dashboard</h1><p><a class="btn" href="/admin/moderation">Open moderation queue</a> <a class="btn light" href="/export-data">Download my data</a></p><p>Traffic is recorded as page and time only; the app does not retain raw visitor IP addresses. Active means seen in the last two minutes. Page-view logging is throttled to 20/minute per visitor, so traffic figures are approximate.</p><div class="shield"><h2>Traffic Shield — app level (measured by The Quad)</h2><p class="small">Rate limits are enforced in the app (posts 30/hour, comments 120/hour, messages 300/hour, logins 20/10 min, registrations 5/hour). Flooding is slowed or blocked before it can take the site down. Recent rate-limit windows below are keyed one-way identifiers only — no raw IPs are stored.</p><h2 class="shield-h2">Traffic Shield — Nginx level (configured, not measured)</h2><p class="small">Nginx sits in front of the app and blocks traffic before Python ever sees it, so its counts are <b>not visible in this panel</b>. These are the limits configured in nginx.conf.template, not live measurements: 20 requests/second per IP (burst 60), max 20 simultaneous connections per IP, max request body 27 MB, body timeout 30s, read/send timeout 60s, keep-alive 15s. If Nginx blocks someone, the app records nothing for that request.</p>'
+        content='<section class="card"><span class="eyebrow">PRIVATE ADMIN VIEW</span><h1>Admin dashboard</h1><p><a class="btn" href="/admin/moderation">Open moderation queue</a> <a class="btn light" href="/export-data">Download my data</a></p><p>Traffic is recorded as page and time only; the app does not retain raw visitor IP addresses. Active means seen in the last two minutes. Page-view logging is throttled to 20/minute per visitor, so traffic figures are approximate.</p><div class="shield"><h2>Traffic Shield — app level (measured by The Campus)</h2><p class="small">Rate limits are enforced in the app (posts 30/hour, comments 120/hour, messages 300/hour, logins 20/10 min, registrations 5/hour). Flooding is slowed or blocked before it can take the site down. Recent rate-limit windows below are keyed one-way identifiers only — no raw IPs are stored.</p><h2 class="shield-h2">Traffic Shield — Nginx level (configured, not measured)</h2><p class="small">Nginx sits in front of the app and blocks traffic before Python ever sees it, so its counts are <b>not visible in this panel</b>. These are the limits configured in nginx.conf.template, not live measurements: 20 requests/second per IP (burst 60), max 20 simultaneous connections per IP, max request body 27 MB, body timeout 30s, read/send timeout 60s, keep-alive 15s. If Nginx blocks someone, the app records nothing for that request.</p>'
         if shield:
             for row in shield:content+='<div class="table-row"><code>%s</code><span>%s windows · %s requests</span></div>'%(esc(row['action']),row['entries'],row['total'])
         else:content+='<p class="muted">No rate-limit activity recorded in the last 2 days.</p>'
@@ -1942,7 +1942,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.go(dest,'network_session=%s; HttpOnly; %sSameSite=Lax; Path=/; Max-Age=%s; Priority=High'%(new,self.secure_cookie(),SESSION_MAX_AGE))
         if not self.authenticated(user,data):return self.html(shell('Sign in required','<section class="card">Session expired or request rejected. <a href="/">Return to sign in</a></section>',user),403)
         if user['must_change_password'] and path not in ('/change-password','/logout'):
-            return self.html(change_password_page(user, 'Your password needs updating before you can use the rest of The Quad.', forced=True),403)
+            return self.html(change_password_page(user, 'Your password needs updating before you can use the rest of The Campus.', forced=True),403)
         if path=='/change-password':
             current=data.get('current_password','');newpwd=data.get('password','');confirm=data.get('confirm_password','')
             if not check_password(current, user['password_hash']):
@@ -2543,7 +2543,7 @@ def main():
     if PRODUCTION and not shutil.which('ffprobe'):
         print('WARNING: ffprobe is unavailable. Production video uploads will be rejected until ffprobe is installed.')
     url='http://127.0.0.1:%s'%PORT
-    print('The Quad is listening on %s:%s'%(HOST,PORT))
+    print('The Campus is listening on %s:%s'%(HOST,PORT))
     print('Mode:','production' if PRODUCTION else 'development')
     if not HOSTED:print('Open it on this device:',url)
     else:print('Open the HTTPS URL provided by your host.')

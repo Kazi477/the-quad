@@ -1,4 +1,6 @@
-# The Quad on Render free + Turso free (DEV ONLY, 2026-11-19)
+# The Campus on Render free + Turso free (DEV ONLY, 2026-11-19)
+
+> **Name (2026-11-19):** the product is now **The Campus** (user-facing branding only). Technical identifiers are unchanged on purpose: Turso database `the-quad`, GitHub repo `Kazi477/the-quad`, Render service `the-quad-free` (URL `https://the-quad-free.onrender.com`). The object-storage bucket suggestion is `the-campus-media` because that bucket does not exist yet.
 
 No payment, no card, friends can open a live link, accounts and posts
 live on a server and survive restarts. This is the route Mitchell
@@ -12,7 +14,7 @@ blocking the dashboard.
 | Render web service, `plan: free` | 750 instance-hours/month, 512 MB RAM, no card, no expiry on the compute itself | Sleeps after 15 min idle (30–60 s cold start); **ephemeral disk** — anything written to local disk is wiped on restart |
 | Turso, free tier | 5 GB storage, 100 databases, 500M row reads / 10M writes / 3 GB syncs per month, no card, GitHub sign-up, does not expire | Writes are the tightest limit (~3.8/sec sustained); point-in-time restore only 1 day |
 
-Render free alone cannot hold The Quad's data: its SQLite file would
+Render free alone cannot hold The Campus's data: its SQLite file would
 be deleted on the first sleep/restart. Turso holds the durable copy;
 the app runs as a libSQL **embedded replica** (local file + cloud
 sync), so a wiped Render disk just re-syncs from Turso on startup.
@@ -142,7 +144,7 @@ never silently falls back to local disk.
 **Deploy steps (in addition to the Turso steps above):**
 
 1. **R2 (recommended on limits):** Cloudflare dashboard → R2 →
-   Create bucket (e.g. `the-quad-media`, **do NOT enable public
+   Create bucket (e.g. `the-campus-media`, **do NOT enable public
    access / r2.dev** — the bucket must stay private) → Manage R2
    API Tokens → Create API Token (Object Read & Write, this
    bucket only). Note the Account ID (dashboard → R2 → Overview,

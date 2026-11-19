@@ -285,7 +285,7 @@ try:
     st, _, page = reset_with(anon, 'session@example.com', '123456')
     check('email-code reset succeeds for session test', st == 200 and 'Password reset' in page)
     st, _, after = get(op3, '/')
-    check('old session is invalidated by the reset', 'Welcome, Session' not in after and 'Welcome to The Quad' in after)
+    check('old session is invalidated by the reset', 'Welcome, Session' not in after and 'Welcome to The Campus' in after)
 
     # --- Regenerate rate limit (fresh user, 6 attempts, limit 5/hour) ---
     op4 = seed_and_login('RegenRate', 'regenrate@example.com')

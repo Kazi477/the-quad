@@ -195,7 +195,7 @@ try:
     st, _, feed_new = get(c_new, '/')
     check('new account IS signed in (feed after register)', 'Welcome, Dup Test' in feed_new, '')
     st, _, feed_dup = get(c_dup, '/')
-    check('duplicate attempt is NOT signed in', 'Welcome, Dup Test' not in feed_dup and 'Welcome to The Quad' in feed_dup, '')
+    check('duplicate attempt is NOT signed in', 'Welcome, Dup Test' not in feed_dup and 'Welcome to The Campus' in feed_dup, '')
 
     # ---------- 3. External CSS / CSP ----------
     st, h, css = get(anon, '/app.css')

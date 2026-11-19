@@ -1,4 +1,4 @@
-"""Dev-only auth test for The Quad (renamed from The Network).
+"""Dev-only auth test for The Campus (renamed from The Network).
 NOT part of the production bundle (Dockerfile copies only the_network_production.py).
 Run: python3 auth_test.py   (from this folder)
 Covers: official /login and /register screens, rename branding, valid/invalid
@@ -64,19 +64,19 @@ try:
     check('server starts / healthz', wait_ready())
     anon = client()
     st, _, home = get(anon, '/')
-    check('anon landing links to official screens', st == 200 and 'href="/login"' in home and 'href="/register"' in home and 'Welcome to The Quad' in home)
+    check('anon landing links to official screens', st == 200 and 'href="/login"' in home and 'href="/register"' in home and 'Welcome to The Campus' in home)
     check('no The Network branding on landing', 'The Network' not in home and 'the network' not in home)
     st, _, login_page = get(anon, '/login')
-    check('/login screen: hero, show/hide, links', st == 200 and 'Log in to The Quad' in login_page and 'data-toggle-password="login-password"' in login_page and 'Forgot password?' in login_page and 'Create an account' in login_page and 'The Quad' in login_page)
+    check('/login screen: hero, show/hide, links', st == 200 and 'Log in to The Campus' in login_page and 'data-toggle-password="login-password"' in login_page and 'Forgot password?' in login_page and 'Create an account' in login_page and 'The Campus' in login_page)
     st, _, reg_page = get(anon, '/register')
     check('/register screen: confirm + strength meter', st == 200 and 'Create your account' in reg_page and 'name="confirm_password"' in reg_page and 'pw-meter-bar' in reg_page and 'pw-hint' in reg_page and '12+ characters' in reg_page)
     check('no The Network branding on auth screens', 'The Network' not in login_page and 'The Network' not in reg_page)
 
     # Register #1: valid owner — should auto-log in straight to the feed
     st, _, page = post(anon, '/register', {'name': 'Owner', 'email': 'owner@example.com', 'password': 'correct-horse-battery-staple', 'confirm_password': 'correct-horse-battery-staple'})
-    check('valid register returns identical generic 200 page', st == 200 and 'Thanks' in page and 'Continue to The Quad' in page)
+    check('valid register returns identical generic 200 page', st == 200 and 'Thanks' in page and 'Continue to The Campus' in page)
     st, _, page = get(anon, '/')
-    check('valid register auto-logs in to feed', st == 200 and 'Welcome, Owner' in page and 'Quad moments' in page and 'Started in a dorm room' in page)
+    check('valid register auto-logs in to feed', st == 200 and 'Welcome, Owner' in page and 'Campus Moments' in page and 'Started in a dorm room' in page)
     token = csrf(page)
     check('new account can post', token != '')
     st, _, _ = post(anon, '/posts', {'csrf': token, 'body': 'first quad post'})
@@ -90,7 +90,7 @@ try:
     # Logout, then login cycle
     st, _, _ = post(anon, '/logout', {'csrf': token})
     st, _, home2 = get(anon, '/')
-    check('logout returns to landing', 'Welcome to The Quad' in home2 and 'Welcome, Owner' not in home2)
+    check('logout returns to landing', 'Welcome to The Campus' in home2 and 'Welcome, Owner' not in home2)
     st, _, page = post(anon, '/login', {'email': 'owner@example.com', 'password': 'correct-horse-battery-staple'})
     check('login after logout works', st == 200 and 'Welcome, Owner' in page)
     # Wrong password: 401, generic error, email preserved, no account hint
@@ -126,9 +126,9 @@ try:
     check('login lockout after repeated failures', codes[-1] == 429 and codes.count(401) >= 10, str(codes))
     # No old branding anywhere served, and auth JS is present
     st, _, admin = get(anon, '/admin')
-    check('admin page has The Quad branding, no The Network', st == 200 and 'The Quad' in admin and 'The Network' not in admin)
+    check('admin page has The Campus branding, no The Network', st == 200 and 'The Campus' in admin and 'The Network' not in admin)
     st, _, js = get(anon, '/app.js')
-    check('app.js has show/hide + strength meter + Quad Radio', st == 200 and 'data-toggle-password' in js and 'pw-meter-bar' in js and 'Quad Radio' in js)
+    check('app.js has show/hide + strength meter + Campus Radio', st == 200 and 'data-toggle-password' in js and 'pw-meter-bar' in js and 'Campus Radio' in js)
 finally:
     p.terminate()
     try:

@@ -1,4 +1,4 @@
-"""Object storage for The Quad — photos (and videos) that survive restarts.
+"""Object storage for The Campus — photos (and videos) that survive restarts.
 
 Problem this solves (Update 11): on Render free the local disk is
 ephemeral, so a photo written to ``DATA_DIR/network_uploads/`` is
@@ -9,7 +9,7 @@ S3-compatible object store instead of on the local disk.
 
 Design — private bucket, proxied through the app (NOT public URLs)
 ------------------------------------------------------------------
-The Quad has private accounts and blocked users, and ``/media/``
+The Campus has private accounts and blocked users, and ``/media/``
 enforces that today (``can_view_upload``: a private user's photo is
 404 for a non-friend, a blocked user gets nothing). A public bucket
 URL (R2 ``r2.dev`` / custom domain) would hand anyone with the link
@@ -50,7 +50,7 @@ Environment variables (all four required to enable; secrets only,
 never in code or in render-free.yaml — Render prompts for them):
   OBJECT_STORAGE_ENDPOINT   e.g. https://<account-id>.r2.cloudflarestorage.com
                             (R2) or https://fly.storage.tigris.dev (Tigris)
-  OBJECT_STORAGE_BUCKET     e.g. the-quad-media
+  OBJECT_STORAGE_BUCKET     e.g. the-campus-media
   OBJECT_STORAGE_ACCESS_KEY R2 API token access key / Tigris access key
   OBJECT_STORAGE_SECRET_KEY the matching secret key
   OBJECT_STORAGE_REGION     optional, default "auto" (R2's region)

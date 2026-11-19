@@ -1,4 +1,4 @@
-"""Dev-only merge test for The Network — The Quad edition.
+"""Dev-only merge test for The Network — The Campus edition.
 NOT part of the production bundle (Dockerfile copies only the_network_production.py).
 Run: python3 merge_test.py   (from this folder)
 Covers: Quad branding/CSS, music post, Nod, stories, friend flow, messages,
@@ -63,9 +63,9 @@ try:
     anon = client()
     st, h, home = get(anon, '/')
     check('anon home 200 + CSP script-src self, no unsafe-inline', st == 200 and "script-src 'self';" in h.get('Content-Security-Policy', '') and 'unsafe-inline' not in h.get('Content-Security-Policy', '').split('script-src', 1)[1].split(';', 1)[0])
-    check('Quad branding on sign-in page (The Network gone)', 'The Quad' in home and 'the quad' in home and 'The Network' not in home and 'the network' not in home)
+    check('Quad branding on sign-in page (The Network gone)', 'The Campus' in home and 'the campus' in home and 'The Network' not in home and 'the network' not in home)
     st, _, login_page = get(anon, '/login')
-    check('official /login screen renders', st == 200 and 'Log in to The Quad' in login_page and 'data-toggle-password' in login_page and '/register' in login_page and 'Forgot password?' in login_page)
+    check('official /login screen renders', st == 200 and 'Log in to The Campus' in login_page and 'data-toggle-password' in login_page and '/register' in login_page and 'Forgot password?' in login_page)
     st, _, reg_page = get(anon, '/register')
     check('official /register screen renders', st == 200 and 'Create your account' in reg_page and 'Confirm password' in reg_page and 'pw-meter-bar' in reg_page and '12+ characters' in reg_page)
     st, hc, css = get(anon, '/app.css')
@@ -83,13 +83,13 @@ try:
     check('owner login', st == 200)
     st, _, page = get(owner, '/')
     token = csrf(page)
-    check('feed renders with Quad hero + moments', st == 200 and 'The Quad' in page and 'Quad moments' in page and 'Started in a dorm room' in page)
-    check('composer has music picker + preview', 'music_track' in page and 'Quad Radio' in page and 'data-quad-track' in page)
+    check('feed renders with Quad hero + moments', st == 200 and 'The Campus' in page and 'Campus Moments' in page and 'Started in a dorm room' in page)
+    check('composer has music picker + preview', 'music_track' in page and 'Campus Radio' in page and 'data-quad-track' in page)
     # Post with music
     st, _, _ = post(owner, '/posts', {'csrf': token, 'body': 'merge test post with music', 'music_track': 'quad-dawn'})
     st, _, page = get(owner, '/')
-    check('post with music renders + music bar', st == 200 and 'merge test post with music' in page and 'Quad Radio · Dawn Loop' in page and 'data-quad-track="quad-dawn"' in page)
-    check('stories row shows poster', 'Quad moments' in page and 'Owner' in page)
+    check('post with music renders + music bar', st == 200 and 'merge test post with music' in page and 'Campus Radio · Dawn Loop' in page and 'data-quad-track="quad-dawn"' in page)
+    check('stories row shows poster', 'Campus Moments' in page and 'Owner' in page)
     m = re.search(r'/post/(\d+)', page)
     pid = m.group(1) if m else ''
     check('post id found', bool(pid), pid)
@@ -102,7 +102,7 @@ try:
     check('second user sees post (public account)', 'merge test post with music' in upage)
     st, _, _ = post(user, '/like', {'csrf': ut, 'post_id': pid, 'action': 'like'})
     st, _, dpage = get(user, '/post/' + pid)
-    check('post detail renders, Nod button + count', st == 200 and 'Nodded' in dpage and 'nod(s)' in dpage and 'Quad Radio' in dpage)
+    check('post detail renders, Nod button + count', st == 200 and 'Nodded' in dpage and 'nod(s)' in dpage and 'Campus Radio' in dpage)
     # Friend request / accept / message
     st, _, fpage = get(user, '/people?q=Owner')
     check('People / Your Circle renders', 'Your Circle' in fpage and 'Owner' in fpage)
@@ -114,9 +114,9 @@ try:
     st, _, _ = post(owner, '/friend', {'csrf': ot, 'user_id': '2', 'action': 'accept'})
     st, _, fpage2 = get(owner, '/friends')
     check('friend accept works, Friends / Your Circle', 'Friend One' in fpage2 and 'Your Circle' in fpage2)
-    st, _, _ = post(owner, '/message', {'csrf': ot, 'to': '2', 'body': 'hello from the quad'})
+    st, _, _ = post(owner, '/message', {'csrf': ot, 'to': '2', 'body': 'hello from the campus'})
     st, _, mpage = get(user, '/messages?with=1')
-    check('message sent + visible to friend', 'hello from the quad' in mpage)
+    check('message sent + visible to friend', 'hello from the campus' in mpage)
     # Comment
     st, _, _ = post(user, '/comment', {'csrf': ut, 'post_id': pid, 'body': 'nice track'})
     st, _, dpage = get(owner, '/post/' + pid)
@@ -186,7 +186,7 @@ try:
         check('page renders: ' + label, st == 200, str(st))
     # /app.js
     st, h, js = get(owner, '/app.js')
-    check('app.js serves Quad Radio, no inline script needed', st == 200 and 'Quad Radio' in js and 'AudioContext' in js and 'data-quad-track' in js)
+    check('app.js serves Campus Radio, no inline script needed', st == 200 and 'Campus Radio' in js and 'AudioContext' in js and 'data-quad-track' in js)
     # Invalid music track is rejected / stored as none
     st, _, page = get(owner, '/')
     token = csrf(page)

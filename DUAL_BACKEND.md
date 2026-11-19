@@ -1,4 +1,4 @@
-# Dual backend with failover — The Quad (DEV ONLY, 2026-11-19)
+# Dual backend with failover — The Campus (DEV ONLY, 2026-11-19)
 
 ## What this is
 Two Python backend processes, both running the same

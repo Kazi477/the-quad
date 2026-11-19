@@ -309,7 +309,7 @@ try:
     import datetime
     future = (datetime.datetime.now() + datetime.timedelta(days=2)).strftime('%Y-%m-%dT%H:%M')
     st, _, page = get(alice, '/events')
-    st, _, _ = post(alice, '/event', {'csrf': csrf(page), 'title': 'Quad BBQ', 'description': 'Bring food', 'starts_at': future, 'location': 'The Quad', 'group_id': str(gid)})
+    st, _, _ = post(alice, '/event', {'csrf': csrf(page), 'title': 'Quad BBQ', 'description': 'Bring food', 'starts_at': future, 'location': 'The Campus', 'group_id': str(gid)})
     with db() as c:
         ev = c.execute("SELECT id FROM events WHERE title='Quad BBQ'").fetchone()
     check('event created', bool(ev), '')
