@@ -1,0 +1,72 @@
+services:
+  - type: web
+    name: the-quad-free
+    runtime: docker
+    plan: free
+    healthCheckPath: /healthz
+    autoDeployTrigger: commit
+    maxShutdownDelaySeconds: 30
+    envVars:
+      - key: PRODUCTION
+        value: "1"
+      - key: TRUST_PROXY
+        value: "1"
+      - key: BACKEND_PORT
+        value: "8081"
+      # Ephemeral on purpose: Render free cannot attach a disk, and
+      # the local replica file is wiped on every restart/sleep. That
+      # is fine — Turso is the durable copy and the replica re-syncs
+      # from it on startup. Do NOT point DATA_DIR at a paid disk here.
+      - key: DATA_DIR
+        value: /tmp/quad-data
+      - key: APP_SECRET
+        generateValue: true
+      - key: ADMIN_EMAILS
+        value: 5rjchzz6j9@privaterelay.appleid.com,mitchellwhite018@gmail.com
+      - key: OWNER_NAME
+        value: Mitchell White
+      # Turso (free tier, no card): set these in the Render dashboard
+      # after creating the database at turso.tech (GitHub sign-up).
+      # TURSO_DATABASE_URL is the libsql://...turso.io URL,
+      # TURSO_AUTH_TOKEN is a database auth token. Both are secrets:
+      # sync: false so Render prompts for them instead of storing
+      # them in this file.
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
+      # Object storage for photos (Update 11) — S3-compatible, private
+      # bucket, proxied through the app's /media/ route (never a public
+      # URL, so private photos stay private). Recommended: Cloudflare
+      # R2 free (10 GB, $0 egress) — endpoint is
+      # https://<account-id>.r2.cloudflarestorage.com, region "auto".
+      # Caveat: R2 signup may ask for a payment method on file; if it
+      # does, do NOT add a card — use Tigris instead (no card, 5 GB,
+      # endpoint https://fly.storage.tigris.dev). Either way the same
+      # four values below; Render prompts for them, never store keys
+      # in this file. When these are unset, uploads fall back to the
+      # local disk and are lost on Render free restarts.
+      - key: OBJECT_STORAGE_ENDPOINT
+        sync: false
+      - key: OBJECT_STORAGE_BUCKET
+        sync: false
+      - key: OBJECT_STORAGE_ACCESS_KEY
+        sync: false
+      - key: OBJECT_STORAGE_SECRET_KEY
+        sync: false
+      - key: OBJECT_STORAGE_REGION
+        value: "auto"
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USERNAME
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_USE_SSL
+        value: "0"
+    # No disk: on the free plan Render cannot attach a persistent
+    # disk. That is the whole reason the database lives in Turso.

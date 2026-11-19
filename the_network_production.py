@@ -8,7 +8,9 @@ render.yaml, and the admin/owner email list. No live deployment from this dev co
 Run this file locally, then open http://127.0.0.1:8080 on the same device. The
 server listens on all network interfaces; hosted Python services should provide PORT.
 The first account is the admin. Accounts, posts, messages and profile data live in
-network.db; uploaded media lives in network_uploads beside this script.
+network.db; uploaded media lives in network_uploads beside this script,
+or in object storage (see object_storage.py) when OBJECT_STORAGE_*
+is configured — that is the mode that survives Render free restarts.
 This local server is for learning/testing. It does not update or host the public Site.
 
 To send password reset emails, configure SMTP_HOST, SMTP_FROM, SMTP_PORT (587 by
@@ -21,6 +23,7 @@ from email.message import EmailMessage
 from email.policy import default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import object_storage
 
 PORT = int(os.environ.get('BACKEND_PORT') or os.environ.get('PORT','8080'))
 HOST = os.environ.get('HOST','0.0.0.0')
@@ -58,6 +61,28 @@ if PRODUCTION and not os.environ.get('APP_SECRET'):
 
 
 def connect():
+    # Update 10 (Render free + Turso): when TURSO_DATABASE_URL and
+    # TURSO_AUTH_TOKEN are set, open the database as a libSQL embedded
+    # replica via db_backend (local file synced to the Turso cloud
+    # primary, so data survives Render's ephemeral disk). Otherwise
+    # this is exactly the old plain-sqlite3 path — db_backend is only
+    # imported in Turso mode, so the default run stays stdlib-only.
+    turso_url = os.environ.get('TURSO_DATABASE_URL', '').strip()
+    turso_token = os.environ.get('TURSO_AUTH_TOKEN', '').strip()
+    if turso_url or turso_token:
+        if not (turso_url and turso_token):
+            raise RuntimeError(
+                'Turso mode needs both TURSO_DATABASE_URL and '
+                'TURSO_AUTH_TOKEN set')
+        import db_backend
+        # 'local' is a dev-test sentinel: run the libSQL driver
+        # against a local file with no cloud sync, so the Turso code
+        # path can be tested without a real Turso database. It is
+        # NOT a deploy mode — on Render, TURSO_DATABASE_URL must be
+        # the real libsql:// URL.
+        sync_url = None if turso_url == 'local' else turso_url
+        return db_backend.connect_turso(DB_PATH, sync_url=sync_url,
+                                       auth_token=turso_token)
     db = sqlite3.connect(str(DB_PATH), timeout=5)
     db.row_factory = sqlite3.Row
     db.execute('PRAGMA foreign_keys=ON')
@@ -154,6 +179,12 @@ def init_db():
         CREATE INDEX IF NOT EXISTS blocks_blocked_idx ON blocks(blocked_id,blocker_id);
         CREATE INDEX IF NOT EXISTS audit_created_idx ON audit_log(created);
         ''')
+        # Update 11 (object storage): where each upload lives, per file.
+        # 'local' = DATA_DIR/network_uploads (old behaviour, still the
+        # fallback); 'object' = the S3-compatible bucket. Existing rows
+        # predate the column and default to 'local', so old photos keep
+        # serving from disk even after object storage is switched on.
+        add_column(c, 'uploads', 'storage', "TEXT NOT NULL DEFAULT 'local'")
         # Keep operational tables bounded and remove expired credentials.
         now=time.time()
         c.execute('DELETE FROM page_views WHERE created<?',(now-90*86400,))
@@ -479,6 +510,27 @@ def backup_database():
     # backup would overwrite/clash with the other. Retention (newest 7,
     # network-*.db) is unchanged.
     target=BACKUP_DIR/('network-%s-p%s.db'%(stamp,PORT))
+    # Update 10 (Render free + Turso): the libSQL wrapper has no
+    # .backup(), so sync the replica and copy the local file with the
+    # sqlite3 backup API instead. The Turso cloud copy is the real
+    # durable backup; this local file is only a convenience copy.
+    turso_url = os.environ.get('TURSO_DATABASE_URL', '').strip()
+    turso_token = os.environ.get('TURSO_AUTH_TOKEN', '').strip()
+    if turso_url and turso_token:
+        try:
+            import db_backend
+            ok = db_backend.backup_turso(DB_PATH, target, turso_url,
+                                         turso_token)
+            if not ok:
+                target.unlink(missing_ok=True)
+                return None
+            backups=sorted(BACKUP_DIR.glob('network-*.db'),key=lambda x:x.stat().st_mtime,reverse=True)
+            for old in backups[7:]:old.unlink(missing_ok=True)
+            return target
+        except Exception as exc:
+            print('Database backup failed:',type(exc).__name__)
+            target.unlink(missing_ok=True)
+            return None
     try:
         src=connect();dst=sqlite3.connect(str(target))
         with dst:src.backup(dst)
@@ -822,6 +874,61 @@ REGISTRATION_NOTICE = ('<section class="card"><h1>Thanks — check your next ste
     '<p>Try <a href="/login">signing in</a>, or use <a href="/forgot-password">Forgot password</a> to reset it.</p></section>')
 
 
+def upload_storage(c, key):
+    """'object' or 'local' for one upload key ('local' for legacy rows)."""
+    row = c.execute('SELECT storage FROM uploads WHERE key=?',
+                    (key,)).fetchone()
+    if not row:
+        return 'local'
+    try:
+        return row['storage'] or 'local'
+    except Exception:
+        return 'local'
+
+
+def delete_stored_file(key, storage):
+    """Delete one stored file, best effort — never raises.
+
+    Object deletes can fail when the bucket is unreachable; a
+    failed delete must never break deleting a post or an account.
+    The DB row is the source of truth, so an orphaned object is
+    unreachable and harmless (it is never served without a row).
+    """
+    if storage == 'object':
+        try:
+            object_storage.delete_object(key)
+        except Exception as exc:  # noqa: BLE001 - log and move on
+            print('Object storage delete failed for %s: %s'
+                  % (key, type(exc).__name__))
+    else:
+        (UPLOAD_DIR / key).unlink(missing_ok=True)
+
+
+def move_to_removed(key, storage):
+    """Park one file for the 30-day restore window.
+
+    Local files move to removed_uploads/ as before. Object files
+    stay in the bucket — there is no local file to move, and
+    deleting the object would make the restore unrecoverable.
+    Restore re-creates the DB row and the object is live again.
+    """
+    if storage == 'object':
+        return
+    src = UPLOAD_DIR / key
+    if src.is_file():
+        shutil.move(str(src), str(REMOVED_DIR / key))
+
+
+def restore_stored_file(key, storage):
+    """Bring one parked file back. Object files need no move."""
+    if storage == 'object':
+        return
+    src = REMOVED_DIR / key
+    if src.is_file():
+        shutil.move(str(src), str(UPLOAD_DIR / key))
+
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version='TheQuad'
     sys_version=''
@@ -943,10 +1050,25 @@ class Handler(BaseHTTPRequestHandler):
             key=urllib.parse.unquote(path[len('/media/'):])
             if not key or '/' in key or '..' in key:self.html('Not found.',404);return
             with connect() as c:
-                row=c.execute('SELECT content_type FROM uploads WHERE key=?',(key,)).fetchone()
+                row=c.execute('SELECT content_type, storage FROM uploads WHERE key=?',(key,)).fetchone()
                 allowed=bool(row and can_view_upload(c,user['id'],key))
+                storage = (row['storage'] if row and row['storage'] else 'local')
+            if not row or not allowed:self.html('Not found.',404);return
+            # Permission is checked first, whatever the storage mode:
+            # the bucket is private and is never exposed directly, so
+            # a private photo stays private even in object mode.
+            if storage=='object':
+                try:
+                    data=object_storage.get_object(key)
+                except Exception:
+                    # Storage down: the post still renders, this one
+                    # file 404s. Never crash the request for it.
+                    data=None
+                if data is None:self.html('Not found.',404);return
+                self.send_response(200);self.send_header('Content-Type',row['content_type']);self.send_header('Content-Length',str(len(data)));self.send_header('Content-Disposition','inline');self.security_headers('private, max-age=3600');self.end_headers();self.wfile.write(data)
+                return
             target=UPLOAD_DIR/key
-            if not row or not allowed or not target.is_file():self.html('Not found.',404);return
+            if not target.is_file():self.html('Not found.',404);return
             size=target.stat().st_size;self.send_response(200);self.send_header('Content-Type',row['content_type']);self.send_header('Content-Length',str(size));self.send_header('Content-Disposition','inline');self.security_headers('private, max-age=3600');self.end_headers()
             with target.open('rb') as media_file:
                 while True:
@@ -1622,32 +1744,73 @@ class Handler(BaseHTTPRequestHandler):
             content+='<p class="muted">No accounts removed recently.</p>'
         content+='</div></section></section>'
         return self.html(shell('Admin',content,user))
-    def save_upload(self,user,fields,files,name,kind):
-        if name not in files:return None
-        filename,data,ctype=files[name]
-        is_img=ctype in ('image/jpeg','image/png','image/gif','image/webp');is_vid=ctype in ('video/mp4','video/webm')
-        if kind=='avatar' and not is_img:raise ValueError('Profile pictures must be JPEG, PNG, GIF or WebP.')
-        if kind=='post' and not (is_img or is_vid):raise ValueError('Posts support JPEG, PNG, GIF, WebP, MP4 and WebM.')
-        if not valid_file(data,ctype):raise ValueError('The file contents do not match its type.')
-        limit=25_000_000 if is_vid else 8_000_000
-        if len(data)>limit:raise ValueError('Videos must be under 25 MB; photos under 8 MB.')
-        ext=mimetypes.guess_extension(ctype) or '.bin';key=uuid.uuid4().hex+ext
-        target=UPLOAD_DIR/key
-        with open(target,'wb') as f:f.write(data)
+    def save_upload(self, user, fields, files, name, kind):
+        if name not in files:
+            return None
+        filename, data, ctype = files[name]
+        is_img = ctype in ('image/jpeg', 'image/png', 'image/gif', 'image/webp')
+        is_vid = ctype in ('video/mp4', 'video/webm')
+        if kind == 'avatar' and not is_img:
+            raise ValueError('Profile pictures must be JPEG, PNG, GIF or WebP.')
+        if kind == 'post' and not (is_img or is_vid):
+            raise ValueError('Posts support JPEG, PNG, GIF, WebP, MP4 and WebM.')
+        if not valid_file(data, ctype):
+            raise ValueError('The file contents do not match its type.')
+        limit = 25_000_000 if is_vid else 8_000_000
+        if len(data) > limit:
+            raise ValueError('Videos must be under 25 MB; photos under 8 MB.')
+        ext = mimetypes.guess_extension(ctype) or '.bin'
+        key = uuid.uuid4().hex + ext
+        use_object = object_storage.enabled()
+        # Videos must be verified server-side first, whatever the
+        # storage mode: ffprobe needs a real file, so write a temp
+        # one, check it, then store (object) or move it (local).
+        tmp_path = None
         if is_vid:
-            duration=verified_video_duration(target)
+            tmp_path = UPLOAD_DIR / ('.tmp-' + key)
+            with open(tmp_path, 'wb') as f:
+                f.write(data)
+            duration = verified_video_duration(tmp_path)
             if duration is None:
-                # No client-supplied fallback: a duration the server cannot
-                # verify itself must not be trusted, in dev or production.
-                # The browser-side duration_ms field is ignored entirely.
-                target.unlink(missing_ok=True);raise ValueError('Video validation is unavailable on the server. Try again later.')
-            if not duration or duration>30.25:
-                target.unlink(missing_ok=True);raise ValueError('Videos must be 30 seconds or shorter.')
+                # No client-supplied fallback: a duration the server
+                # cannot verify itself must not be trusted, in dev
+                # or production. The browser-side duration_ms field
+                # is ignored entirely.
+                tmp_path.unlink(missing_ok=True)
+                raise ValueError('Video validation is unavailable on the server. Try again later.')
+            if not duration or duration > 30.25:
+                tmp_path.unlink(missing_ok=True)
+                raise ValueError('Videos must be 30 seconds or shorter.')
         try:
-            with connect() as c:c.execute('INSERT INTO uploads(key,user_id,content_type,size,created) VALUES(?,?,?,?,?)',(key,user['id'],ctype,len(data),time.time()))
+            if use_object:
+                # Deliberate: no silent fallback to local disk. If
+                # the bucket is down, the upload fails loudly and
+                # nothing is created — a local copy would look fine
+                # and then vanish on the next Render restart.
+                try:
+                    object_storage.put_object(key, data, ctype)
+                except object_storage.ObjectStorageError:
+                    raise ValueError('Photo storage is unavailable right now. Try again later.')
+                storage = 'object'
+            else:
+                target = UPLOAD_DIR / key
+                if tmp_path is not None:
+                    shutil.move(str(tmp_path), str(target))
+                else:
+                    with open(target, 'wb') as f:
+                        f.write(data)
+                storage = 'local'
+        finally:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
+        try:
+            with connect() as c:
+                c.execute('INSERT INTO uploads(key,user_id,content_type,size,created,storage) VALUES(?,?,?,?,?,?)',
+                          (key, user['id'], ctype, len(data), time.time(), storage))
         except Exception:
-            target.unlink(missing_ok=True);raise
-        return key,ctype
+            delete_stored_file(key, storage)
+            raise
+        return key, ctype
     def do_POST(self):
         path=urllib.parse.urlparse(self.path).path;user,token=self.session()
         if not self.same_origin_request():
@@ -1831,14 +1994,13 @@ class Handler(BaseHTTPRequestHandler):
                     'uploads': rows('uploads','user_id=?',(target,)),
                     'blocks': rows('blocks','blocker_id=? OR blocked_id=?',(target,target)),
                 }
-                keys=[r['key'] for r in c.execute('SELECT key FROM uploads WHERE user_id=?',(target,)).fetchall()]
+                keys=[(r['key'], r['storage'] if r['storage'] else 'local') for r in c.execute('SELECT key, storage FROM uploads WHERE user_id=?',(target,)).fetchall()]
                 now=time.time()
                 cur=c.execute('INSERT INTO removed_users(original_user_id,name,email,password_hash,is_admin,joined,data_json,backup_file,removed_at,removed_by,restore_deadline) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(target,display(victim),victim['email'],victim['password_hash'],victim['is_admin'],victim['joined'],json.dumps(saved,ensure_ascii=False),backup_path.name if backup_path else None,now,user['id'],now+REMOVED_RETENTION_DAYS*86400))
                 audit_event(c,user['id'],'remove_user','user',target,{'name':display(victim),'email':victim['email'],'body':display(victim)+' <'+victim['email']+'>','restore_id':cur.lastrowid,'backup':backup_path.name if backup_path else None})
                 c.execute('DELETE FROM users WHERE id=?',(target,))
-            for key in keys:
-                src=UPLOAD_DIR/key
-                if src.is_file():shutil.move(str(src),str(REMOVED_DIR/key))
+            for key, storage in keys:
+                move_to_removed(key, storage)
             return self.go('/admin')
         if path=='/admin/restore-user':
             if not user['is_admin']:return self.html(shell('Admin','<section class="card"><h1>Admin access only</h1></section>',user),403)
@@ -1891,7 +2053,7 @@ class Handler(BaseHTTPRequestHandler):
                         tgt = str(post_map[int(tgt)])
                     c.execute('INSERT OR IGNORE INTO notifications(id,user_id,actor_id,kind,target_id,body,created,read_at) VALUES(?,?,?,?,?,?,?,?)',(row.get('id'), remap_user(row.get('user_id')), remap_user(row.get('actor_id')), row.get('kind'), tgt, row.get('body'), row.get('created'), row.get('read_at')))
                 for row in saved.get('uploads',[]):
-                    c.execute('INSERT OR IGNORE INTO uploads(key,user_id,content_type,size,created) VALUES(?,?,?,?,?)',(row.get('key'), remap_user(row.get('user_id')), row.get('content_type'), row.get('size'), row.get('created')))
+                    c.execute('INSERT OR IGNORE INTO uploads(key,user_id,content_type,size,created,storage) VALUES(?,?,?,?,?,?)',(row.get('key'), remap_user(row.get('user_id')), row.get('content_type'), row.get('size'), row.get('created'), row.get('storage') or 'local'))
                 for row in saved.get('blocks',[]): 
                     c.execute('INSERT OR IGNORE INTO blocks(blocker_id,blocked_id,created) VALUES(?,?,?)',(remap_user(row.get('blocker_id')), remap_user(row.get('blocked_id')), row.get('created')))
                 # Restore display name / bio / interests / avatar from the saved user row.
@@ -1899,8 +2061,7 @@ class Handler(BaseHTTPRequestHandler):
                 audit_event(c,user['id'],'restore_user','user',uid,{'name':rec['name'],'email':rec['email'],'body':rec['name']+' <'+rec['email']+'>'})
                 c.execute('DELETE FROM removed_users WHERE id=?',(rid,))
             for row in saved.get('uploads',[]):
-                src=REMOVED_DIR/row['key']
-                if src.is_file():shutil.move(str(src),str(UPLOAD_DIR/row['key']))
+                restore_stored_file(row['key'], row.get('storage') or 'local')
             return self.go('/admin')
         if path=='/logout':
             with connect() as c:c.execute('DELETE FROM sessions WHERE token=?',(token,))
@@ -1952,7 +2113,11 @@ class Handler(BaseHTTPRequestHandler):
                 if p['user_id']!=user['id'] and not user['is_admin']:return self.html(shell('Post','You can remove only your own posts.',user),403)
                 audit_event(c,user['id'],'delete_post','post',pid,{'owner_user_id':p['user_id'],'body':(p['body'] or '')[:2000],'media_key':p['media_key'],'admin_action':bool(user['is_admin'] and p['user_id']!=user['id'])})
                 c.execute('DELETE FROM posts WHERE id=?',(pid,))
-                if p['media_key'] and not c.execute('SELECT 1 FROM users WHERE avatar_key=? UNION SELECT 1 FROM posts WHERE media_key=?',(p['media_key'],p['media_key'])).fetchone():c.execute('DELETE FROM uploads WHERE key=?',(p['media_key'],));(UPLOAD_DIR/p['media_key']).unlink(missing_ok=True)
+                dead_key=None;dead_storage='local'
+                if p['media_key'] and not c.execute('SELECT 1 FROM users WHERE avatar_key=? UNION SELECT 1 FROM posts WHERE media_key=?',(p['media_key'],p['media_key'])).fetchone():
+                    dead_storage=upload_storage(c,p['media_key']);dead_key=p['media_key']
+                    c.execute('DELETE FROM uploads WHERE key=?',(p['media_key'],))
+            if dead_key:delete_stored_file(dead_key,dead_storage)
             return self.go('/')
         if path=='/like':
             try:pid=int(data.get('post_id',''))
@@ -2035,7 +2200,11 @@ class Handler(BaseHTTPRequestHandler):
             with connect() as c:
                 old=c.execute('SELECT avatar_key FROM users WHERE id=?',(user['id'],)).fetchone()['avatar_key'];key=up[0] if up else old
                 c.execute('UPDATE users SET display_name=?,bio=?,interests=?,avatar_key=? WHERE id=?',(dn,bio,interests,key,user['id']))
-                if old and key!=old and not c.execute('SELECT 1 FROM posts WHERE media_key=?',(old,)).fetchone():c.execute('DELETE FROM uploads WHERE key=?',(old,));(UPLOAD_DIR/old).unlink(missing_ok=True)
+                dead_storage='local'
+                if old and key!=old and not c.execute('SELECT 1 FROM posts WHERE media_key=?',(old,)).fetchone():
+                    dead_storage=upload_storage(c,old);c.execute('DELETE FROM uploads WHERE key=?',(old,))
+                else:old=None
+            if old:delete_stored_file(old,dead_storage)
             return self.go('/profile')
         if path=='/friend':
             try:target=int(data.get('user_id',''))
@@ -2340,14 +2509,13 @@ class Handler(BaseHTTPRequestHandler):
                 def rows(table,where,args):
                     return [dict(r) for r in c.execute('SELECT * FROM %s WHERE %s'%(table,where),args).fetchall()]
                 saved={'user':dict(user_by_id(c,target)),'settings':rows('user_settings','user_id=?',(target,)),'posts':rows('posts','user_id=?',(target,)),'comments':rows('comments','user_id=?',(target,)),'likes':rows('likes','user_id=?',(target,)),'reactions':rows('reactions','user_id=?',(target,)),'friendships':rows('friendships','requester_id=? OR addressee_id=?',(target,target)),'messages':rows('messages','sender_id=? OR recipient_id=?',(target,target)),'notifications':rows('notifications','user_id=? OR actor_id=?',(target,target)),'uploads':rows('uploads','user_id=?',(target,)),'blocks':rows('blocks','blocker_id=? OR blocked_id=?',(target,target)),'saved_posts':rows('saved_posts','user_id=?',(target,)),'group_members':rows('group_members','user_id=?',(target,)),'poll_votes':rows('poll_votes','user_id=?',(target,))}
-                keys=[r['key'] for r in c.execute('SELECT key FROM uploads WHERE user_id=?',(target,)).fetchall()]
+                keys=[(r['key'], r['storage'] if r['storage'] else 'local') for r in c.execute('SELECT key, storage FROM uploads WHERE user_id=?',(target,)).fetchall()]
                 now=time.time()
                 c.execute('INSERT INTO removed_users(original_user_id,name,email,password_hash,is_admin,joined,data_json,backup_file,removed_at,removed_by,restore_deadline) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(target,display(user),user['email'],user['password_hash'],0,user['joined'],json.dumps(saved,ensure_ascii=False),backup_path.name if backup_path else None,now,target,now+REMOVED_RETENTION_DAYS*86400))
                 audit_event(c,target,'self_delete','user',target,{'name':display(user),'email':user['email']})
                 c.execute('DELETE FROM users WHERE id=?',(target,))
-            for key in keys:
-                src=UPLOAD_DIR/key
-                if src.is_file():shutil.move(str(src),str(REMOVED_DIR/key))
+            for key, storage in keys:
+                move_to_removed(key, storage)
             return self.go('/','network_session=; HttpOnly; %sSameSite=Lax; Path=/; Max-Age=0; Priority=High'%self.secure_cookie())
         return self.html(shell('Not found','Page not found.',user),404)
 
@@ -2381,6 +2549,11 @@ def main():
     else:print('Open the HTTPS URL provided by your host.')
     print('Database:',DB_PATH)
     print('Photos/videos:',UPLOAD_DIR)
+    if object_storage.enabled():
+        cfg=object_storage.config()
+        print('Object storage: enabled (%s/%s)'%(cfg['endpoint'],cfg['bucket']))
+    else:
+        print('Object storage: not configured — uploads stay on local disk (lost on Render free restarts).')
     srv=NetworkHTTPServer((HOST,PORT),Handler)
     def request_shutdown(signum=None,frame=None):
         print('Shutdown requested; finishing active requests.')

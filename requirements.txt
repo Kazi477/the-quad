@@ -1,0 +1,4 @@
+# Only needed when TURSO_DATABASE_URL / TURSO_AUTH_TOKEN are set
+# (Render free + Turso mode). The default local run is stdlib-only
+# and never installs this.
+libsql-experimental==0.0.55
